@@ -9,7 +9,7 @@
 #include <fstream>
 #include <iomanip>
 
-const int N_FEATURES = 2001;          
+const int N_FEATURES = 500;          
 const int N_COMPONENTS = 128;         
 const int HAMMING_THRESHOLD = 25;     
 
