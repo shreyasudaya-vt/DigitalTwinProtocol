@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h> 
+#include "ns3/waypoint-mobility-model.h"
 
 using namespace ns3;
 
@@ -108,24 +109,26 @@ private:
             uint8_t* buffer = new uint8_t[pSize];
             packet->CopyData(buffer, pSize);
 
+            // Fetch the base MobilityModel safely
             Ptr<MobilityModel> uavMob = m_uavNode->GetObject<MobilityModel>();
             Ptr<MobilityModel> jammerMob = m_jammerNode->GetObject<MobilityModel>();
             double distance = uavMob->GetDistanceFrom(jammerMob);
-
-            // Jammer activates only when UAV flies within 15 meters of the Base Station coordinate space
-            if (pSize > 14 && distance < 15.0) {
+	    if (pSize > 14 && distance < 30.0) {
+                double dropProbability = 100.0 * (1.0 - (distance / 30.0) * (distance / 30.0));
                 
-                if (rand() % 100 < 80) {
-                    std::cout << "[ns-3 Egest] 💥 JAMMER DESTROYED PACKET! Signal lost at " << distance << "m." << std::endl;
+                // 1. SIMULATE ERASURE
+                if ((rand() % 100) < dropProbability) {
+                    std::cout << "[ns-3] 💥 JAMMER DESTROYED PACKET! (Dist: " << distance << "m | Drop Prob: " << dropProbability << "%)" << std::endl;
                     delete[] buffer;
-                    continue; // Skip forwarding to the Python Twin
+                    continue; 
                 }
                 
+                // 2. SIMULATE CORRUPTION: Packet survived, but payload gets corrupted
                 uint32_t corruptIdx = 14 + (rand() % (pSize - 14));
                 buffer[corruptIdx] ^= 0xFF; 
-                std::cout << "[ns-3 Egest] ⚡ JAMMER CORRUPTED PACKET! Distance: " << distance << "m. Forwarding..." << std::endl;
+                std::cout << "[ns-3] ⚡ JAMMER CORRUPTED PACKET! Distance: " << distance << "m." << std::endl;
             } else {
-                std::cout << "[ns-3 Egest] ✅ Packet passed cleanly. Distance: " << distance << "m." << std::endl;
+                std::cout << "[ns-3] ✅ Packet passed cleanly. Distance: " << distance << "m." << std::endl;
             }
 
             sendto(m_hostSendTwinFd, buffer, pSize, 0, (struct sockaddr*)&m_twinAddr, sizeof(m_twinAddr));
@@ -152,8 +155,6 @@ int main(int argc, char *argv[]) {
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211n);
     
-    // FIX: Default helper already installs LogDistancePropagationLossModel.
-    // Do not chain AddPropagationLoss a second time to prevent double attenuation.
     YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
     
     YansWifiPhyHelper phy;
@@ -163,23 +164,28 @@ int main(int argc, char *argv[]) {
     NetDeviceContainer devices = wifi.Install(phy, mac, nodes);
 
     MobilityHelper mobility;
-    mobility.SetMobilityModel("ns3::ConstantVelocityMobilityModel");
-    mobility.Install(nodes);
+    
+    // Set Base Station (Node 1) and Jammer (Node 2) to fixed positions at 50m
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(nodes.Get(1));
+    mobility.Install(nodes.Get(2));
+    nodes.Get(1)->GetObject<MobilityModel>()->SetPosition(Vector(50.0, 0.0, 0.0));
+    nodes.Get(2)->GetObject<MobilityModel>()->SetPosition(Vector(50.0, 0.0, 0.0));
 
-    // UAV setup: Starts at 0m, flies forward smoothly at 1.0 m/s
-    Ptr<ConstantVelocityMobilityModel> uavMob = nodes.Get(0)->GetObject<ConstantVelocityMobilityModel>();
-    uavMob->SetPosition(Vector(0.0, 0.0, 0.0));
-    uavMob->SetVelocity(Vector(1.0, 0.0, 0.0)); 
+    // Set UAV (Node 0) to a Waypoint Patrol Path (Flies back and forth at 1 m/s)
+    MobilityHelper uavMobHelper;
+    uavMobHelper.SetMobilityModel("ns3::WaypointMobilityModel");
+    uavMobHelper.Install(nodes.Get(0));
+    Ptr<WaypointMobilityModel> uavMob = nodes.Get(0)->GetObject<WaypointMobilityModel>();
 
-    // Base Station setup: Positioned cleanly at 50m
-    Ptr<ConstantVelocityMobilityModel> bsMob = nodes.Get(1)->GetObject<ConstantVelocityMobilityModel>();
-    bsMob->SetPosition(Vector(50.0, 0.0, 0.0));
-    bsMob->SetVelocity(Vector(0.0, 0.0, 0.0));
-
-    // Jammer setup: Positioned at 50m (co-located next to the critical asset target)
-    Ptr<ConstantVelocityMobilityModel> jammerMob = nodes.Get(2)->GetObject<ConstantVelocityMobilityModel>();
-    jammerMob->SetPosition(Vector(50.0, 0.0, 0.0));
-    jammerMob->SetVelocity(Vector(0.0, 0.0, 0.0));
+    // Waypoint 1: Start at 0m (t=0s)
+    uavMob->AddWaypoint(Waypoint(Seconds(0.0), Vector(0.0, 0.0, 0.0)));
+    // Waypoint 2: Fly to 100m (Passes through Jammer at t=50s)
+    uavMob->AddWaypoint(Waypoint(Seconds(100.0), Vector(100.0, 0.0, 0.0)));
+    // Waypoint 3: Turn around and fly back to 0m (Passes Jammer again at t=150s)
+    uavMob->AddWaypoint(Waypoint(Seconds(200.0), Vector(0.0, 0.0, 0.0)));
+    // Waypoint 4: Fly forward to 100m again (Passes Jammer a third time at t=250s)
+    uavMob->AddWaypoint(Waypoint(Seconds(300.0), Vector(100.0, 0.0, 0.0)));
 
     InternetStackHelper stack;
     stack.Install(nodes);
@@ -191,18 +197,17 @@ int main(int argc, char *argv[]) {
     sender->Setup(9000, Ipv4Address("10.1.1.2"), 80);
     nodes.Get(0)->AddApplication(sender);
     sender->SetStartTime(Seconds(0.0));
-    sender->SetStopTime(Seconds(100.0));
+    sender->SetStopTime(Seconds(300.0));
 
     Ptr<AnastaReceiverApp> receiver = CreateObject<AnastaReceiverApp>();
     receiver->Setup(5000, nodes.Get(0), nodes.Get(2));
     nodes.Get(1)->AddApplication(receiver);
     receiver->SetStartTime(Seconds(0.0));
-    receiver->SetStopTime(Seconds(100.0));
+    receiver->SetStopTime(Seconds(300.0));
 
-    std::cout << "🚀 Real-Time Network Simulation Active." << std::endl;
-    Simulator::Stop(Seconds(100.0)); // Fixed human timing window extension
+    std::cout << "🚀 Real-Time Network Simulation Active. Duration: 300s" << std::endl;
+    Simulator::Stop(Seconds(300.0)); 
     Simulator::Run();
     Simulator::Destroy();
     return 0;
 }
-

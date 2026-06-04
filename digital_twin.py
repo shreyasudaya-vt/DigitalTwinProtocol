@@ -6,7 +6,7 @@ import numpy as np
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from filterpy.kalman import KalmanFilter
-
+from collections import deque
 class DigitalTwinServer:
     def __init__(self, listen_ip="127.0.0.1", listen_port=5000, feedback_ip="127.0.0.1", feedback_port=9001, master_key=b'\x00'*16, salt=b'\x01'*4):
         self.rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -21,6 +21,9 @@ class DigitalTwinServer:
         # PDR Measurement Parameters
         self.received_packets = 0
         self.expected_packets = 0
+        self.window_size = 40 
+        self.pdr_window = deque(maxlen=self.window_size)
+
         self.last_seq = -1
         
         # Enrollment System Configuration
@@ -79,17 +82,20 @@ class DigitalTwinServer:
         
         self.received_packets += 1
         if self.last_seq == -1:
-            self.expected_packets = 1
+            self.pdr_window.append(1)
         else:
             diff = seq - self.last_seq
             if diff > 0:
-                self.expected_packets += diff
-            else:
-                self.expected_packets += 1
-        self.last_seq = seq
+                missed = min(diff - 1, self.window_size)
+                for _ in range(missed):
+                    self.pdr_window.append(0)
+                self.pdr_window.append(1)
+            elif diff <= 0:
+                pass
+        self.last_seq = max(self.last_seq, seq)
         
         # Calculate Packet Delivery Ratio (PDR)
-        pdr = self.received_packets / self.expected_packets
+        pdr = sum(self.pdr_window) / max(1, len(self.pdr_window))
         self.tx_sock.sendto(struct.pack(">f", pdr), self.feedback_address)
         print(f"\n[Twin Engine] Seq: {seq} | Tier: {tier_id} | Channel PDR: {pdr:.2f}")
 
