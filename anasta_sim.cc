@@ -124,7 +124,8 @@ private:
                 }
                 
                 // 2. SIMULATE CORRUPTION: Packet survived, but payload gets corrupted
-                uint32_t corruptIdx = 14 + (rand() % (pSize - 14));
+                uint32_t max_corrupt_len = (pSize - 14 < 16) ? (pSize - 14) : 16;
+		uint32_t corruptIdx = 14 + (rand() % max_corrupt_len);
                 buffer[corruptIdx] ^= 0xFF; 
                 std::cout << "[ns-3] ⚡ JAMMER CORRUPTED PACKET! Distance: " << distance << "m." << std::endl;
             } else {
