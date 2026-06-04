@@ -10,7 +10,7 @@ function final_pca()
     
     % 2. Build absolute paths to your dataset and report folders
     DEVICE_FOLDER = fullfile(script_dir, '01_master_dataset');    
-    REPORT_DIR    = fullfile(script_dir, '01_256reports');         
+    REPORT_DIR    = fullfile(script_dir, 'matlab_reports');         
     
     % 3. Double-check to make sure the folder actually exists before proceeding
     if ~exist(DEVICE_FOLDER, 'dir')
@@ -21,7 +21,7 @@ function final_pca()
     PREFERRED_MULTI_TRAIN_INDICES = 4:6;       % equivalent to list(range(4,7)) -> [4, 5, 6]
     PREFERRED_MULTI_AUTH_INDEX    = 5;
     USE_PHASE     = true;
-    ID_BIT_LENGTH = 128;
+    ID_BIT_LENGTHS = [64 128 256];
     START_FREQ    = 10000;
     END_FREQ      = 1000000;
     N_FREQ_POINTS = 500;
@@ -41,76 +41,105 @@ function final_pca()
     % -------------------------------------------------------------------------
     % SINGLE SWEEP PCA CONFIGURATION
     % -------------------------------------------------------------------------
-    fprintf('\n--> Executing Single-Sweep Registration Phase...\n');
-    [order, bin_ids, model] = build_single_sweep_ids(device_files, PREFERRED_REG_INDEX_SINGLE, REF_FREQ, USE_PHASE, ID_BIT_LENGTH);
-    
-    
-    fprintf('--> Authenticating Single-Sweep Projections...\n');
-    [single_results, flags_s, intra_s, inter_s] = authenticate_files(...
-        model, bin_ids, device_files, PREFERRED_AUTH_INDEX_SINGLE, ...
-        HAMMING_AUTH_THRESHOLD, EXCLUDED_DEVICES ...
-    );
-    if ~isempty(EXCLUDED_DEVICES)
-        fprintf('    Excluded devices: %s\n', strjoin(EXCLUDED_DEVICES, ', '));
-    end
-    % Save single-sweep metrics CSV
-    single_table = results2table(single_results);
-    writetable(single_table, fullfile(REPORT_DIR, 'single_sweep_metrics.csv'));
-    
-    % Plot Combined Histogram Metrics
-    plot_combined_pdf(...
-        intra_s, inter_s, ...
-        'Hamming Distance Distribution (Single-Sweep PCA)', ...
-        fullfile(REPORT_DIR, 'single_combined.png') ...
-    );
-    % Calculate single-sweep authentication rate
-    total_reg_s = length(order);
-    success_s = 0;
-    for i = 1:length(order)
-        d = order{i};
-        if isKey(flags_s, d) && all(flags_s(d))
-            success_s = success_s + 1;
-        end
-    end
-    if total_reg_s > 0, rate_s = (success_s / total_reg_s) * 100; else, rate_s = 0; end
-    % -------------------------------------------------------------------------
-    % MULTI SWEEP PCA CONFIGURATION
-    % -------------------------------------------------------------------------
-    fprintf('\n--> Executing Multi-Sweep Registration Phase...\n');
-    [bin_ids_m, model_m] = build_multi_sweep_ids(device_files, PREFERRED_MULTI_TRAIN_INDICES, REF_FREQ, USE_PHASE, ID_BIT_LENGTH);
-    fprintf('--> Authenticating Multi-Sweep Projections...\n');
-    [multi_results, flags_m, intra_m, inter_m] = authenticate_files(...
-        model_m, bin_ids_m, device_files, PREFERRED_MULTI_AUTH_INDEX, ...
-        HAMMING_AUTH_THRESHOLD, EXCLUDED_DEVICES ...
-    );
-    % Save multi-sweep metrics CSV
-    multi_table = results2table(multi_results);
-    writetable(multi_table, fullfile(REPORT_DIR, 'multi_sweep_metrics.csv'));
-    
+    for BIT_LEN = ID_BIT_LENGTHS
 
-    % Calculate multi-sweep authentication rate
-    m_keys = sorted_keys(bin_ids_m);
-    total_reg_m = length(m_keys);
-    success_m = 0;
-    for i = 1:length(m_keys)
-        d = m_keys{i};
-        if isKey(flags_m, d) && all(flags_m(d))
-            success_m = success_m + 1;
+        fprintf('\n=================================================\n');
+        fprintf('Running PCA Authentication with %d-bit IDs\n', BIT_LEN);
+        fprintf('=================================================\n');
+        fprintf('\n--> Executing Single-Sweep Registration Phase...\n');
+        [order, bin_ids, model] = build_single_sweep_ids(device_files, PREFERRED_REG_INDEX_SINGLE, REF_FREQ, USE_PHASE, BIT_LEN);
+        
+        
+        fprintf('--> Authenticating Single-Sweep Projections...\n');
+        [single_results, flags_s, intra_s, inter_s] = authenticate_files(...
+            model, bin_ids, device_files, PREFERRED_AUTH_INDEX_SINGLE, ...
+            HAMMING_AUTH_THRESHOLD, EXCLUDED_DEVICES ...
+        );
+        if ~isempty(EXCLUDED_DEVICES)
+            fprintf('    Excluded devices: %s\n', strjoin(EXCLUDED_DEVICES, ', '));
         end
+        % Save single-sweep metrics CSV
+        single_table = results2table(single_results);
+        writetable(single_table, fullfile(REPORT_DIR, sprintf('single_sweep_metrics_%dbit.csv',BIT_LEN)));
+        
+        % Plot Combined Histogram Metrics
+        plot_combined_pdf(...
+            intra_s, inter_s, ...
+            'Hamming Distance Distribution (Single-Sweep PCA)', ...
+            fullfile(REPORT_DIR, 'single_combined.png') ...
+        );
+        % Calculate single-sweep authentication rate
+        total_reg_s = length(order);
+        success_s = 0;
+        for i = 1:length(order)
+            d = order{i};
+            if isKey(flags_s, d) && all(flags_s(d))
+                success_s = success_s + 1;
+            end
+        end
+        if total_reg_s > 0, rate_s = (success_s / total_reg_s) * 100; else, rate_s = 0; end
+        % -------------------------------------------------------------------------
+        % MULTI SWEEP PCA CONFIGURATION
+        % -------------------------------------------------------------------------
+        fprintf('\n--> Executing Multi-Sweep Registration Phase...\n');
+        [bin_ids_m, model_m] = build_multi_sweep_ids(device_files, PREFERRED_MULTI_TRAIN_INDICES, REF_FREQ, USE_PHASE, BIT_LEN);
+        fprintf('--> Authenticating Multi-Sweep Projections...\n');
+        [multi_results, flags_m, intra_m, inter_m] = authenticate_files(...
+            model_m, bin_ids_m, device_files, PREFERRED_MULTI_AUTH_INDEX, ...
+            HAMMING_AUTH_THRESHOLD, EXCLUDED_DEVICES ...
+        );
+        % Save multi-sweep metrics CSV
+        multi_table = results2table(multi_results);
+        writetable(multi_table, fullfile(REPORT_DIR, sprintf('multi_sweep_metrics_%dbit.csv',BIT_LEN)));
+        
+    
+        % Calculate multi-sweep authentication rate
+        m_keys = sorted_keys(bin_ids_m);
+        total_reg_m = length(m_keys);
+        success_m = 0;
+        for i = 1:length(m_keys)
+            d = m_keys{i};
+            if isKey(flags_m, d) && all(flags_m(d))
+                success_m = success_m + 1;
+            end
+        end
+        if total_reg_m > 0, rate_m = (success_m / total_reg_m) * 100; else, rate_m = 0; end
+        % -------------------------------------------------------------------------
+        % EXPORT DATA TABLES & SUMMARY REPORT
+        % -------------------------------------------------------------------------
+        Scenario   = {'Single'; 'Multi'};
+        Registered = [total_reg_s; total_reg_m];
+        Success    = [success_s; success_m];
+        Rate_Pct   = [rate_s; rate_m];
+        MeanIntra  = [mean(intra_s); mean(intra_m)];
+        MeanInter  = [mean(inter_s); mean(inter_m)];
+        Separation = MeanInter - MeanIntra;
+        
+        comp_table = table( ...
+            Scenario, ...
+            Registered, ...
+            Success, ...
+            Rate_Pct, ...
+            MeanIntra, ...
+            MeanInter, ...
+            Separation, ...
+            'VariableNames', { ...
+                'Scenario', ...
+                'Registered', ...
+                'Success', ...
+                'Rate_Pct', ...
+                'MeanIntra', ...
+                'MeanInter', ...
+                'Separation' ...
+            } ...
+        );
+        
+        writetable( ...
+            comp_table, ...
+            fullfile(REPORT_DIR, sprintf('comparison_summary_%dbit.csv', BIT_LEN)) ...
+        );
+        % Export the debug records
     end
-    if total_reg_m > 0, rate_m = (success_m / total_reg_m) * 100; else, rate_m = 0; end
-    % -------------------------------------------------------------------------
-    % EXPORT DATA TABLES & SUMMARY REPORT
-    % -------------------------------------------------------------------------
-    Scenario = {'Single'; 'Multi'};
-    Registered = [total_reg_s; total_reg_m];
-    Success = [success_s; success_m];
-    Rate_Pct = [rate_s; rate_m];
-    MeanIntra = [mean(intra_s); mean(intra_m)];
-    comp_table = table(Scenario, Registered, Success, Rate_Pct, MeanIntra, ...
-                       'VariableNames', {'Scenario', 'Registered', 'Success', 'Rate_Pct', 'MeanIntra'});
-    writetable(comp_table, fullfile(REPORT_DIR, 'comparison_summary.csv'));
-    % Export the debug records
     export_device_debug_data(REPORT_DIR, bin_ids, bin_ids_m, single_results, multi_results);
     % Generate Markdown Document Report
     fid = fopen(fullfile(REPORT_DIR, 'Final_Results.md'), 'w');
@@ -135,7 +164,8 @@ function final_pca()
         fclose(fid);
     end
     fprintf('\n--> Processing complete! Reports saved to %s\n', REPORT_DIR);
-end
+   end
+
 %% ========================================================================
 %% LOCAL UTILITY FUNCTIONS
 %% ========================================================================
