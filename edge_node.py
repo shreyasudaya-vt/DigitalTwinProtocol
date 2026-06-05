@@ -9,6 +9,7 @@ from Crypto.Util import Counter
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import sys
+
 # Natively bind parameters directly from your project's final_pca.py
 try:
     from final_pca import (
@@ -51,6 +52,9 @@ class AnastaEdgeNode:
         self.pca = None
         self.target_device = None
         self.device_files_map = {}
+        
+        # ADDED: Store the locked identity baseline for the Helper Data Algorithm
+        self.enrollment_bits = None 
 
         self.running = True
         self.feedback_thread = threading.Thread(target=self._listen_for_feedback, daemon=True)
@@ -94,7 +98,6 @@ class AnastaEdgeNode:
         self.pca = PCA(n_components=self.total_components)
         self.pca.fit(self.scaler.fit_transform(train_matrix))
         
-        # Pick the first valid device found in the dataset to act as this Edge Node's hardware identity
         valid_devs = [d for d in self.device_files_map.keys() if d not in excluded_set]
         self.target_device = valid_devs[0] if valid_devs else list(self.device_files_map.keys())[0]
         
@@ -148,8 +151,28 @@ class AnastaEdgeNode:
         w_high = proj[:self.n_identity]
         w_low = proj[self.n_identity:self.total_components]
         
-        k_auth = np.packbits(np.where(w_high > 0, 1, 0).astype(np.uint8)).tobytes()
+        # ==================================================================
+        # HELPER DATA ALGORITHM: "Dark Bit" Deadband Filter
+        # ==================================================================
+        
+        # 1. ENROLLMENT: Lock in the baseline state on the very first packet
+        if self.enrollment_bits is None:
+            self.enrollment_bits = np.where(w_high > 0, 1, 0).astype(np.uint8)
+            
+        # 2. DEADBAND FILTER: Prevent thermal noise from flipping near-zero "Dark Bits"
+        current_bits = np.zeros(self.n_identity, dtype=np.uint8)
+        for i in range(self.n_identity):
+            if w_high[i] > 0.05:          # Confident 1
+                current_bits[i] = 1
+            elif w_high[i] < -0.05:       # Confident 0
+                current_bits[i] = 0
+            else:                         # Danger zone (Dark Bit): Trust the enrollment state!
+                current_bits[i] = self.enrollment_bits[i]
+        
+        # Pack the cleaned, stable bits into bytes
+        k_auth = np.packbits(current_bits).tobytes()
         k_health = w_low.tolist()
+        
         return k_auth, k_health
 
     def transmit(self, k_auth, k_health, telemetry_val=22.4):
@@ -186,25 +209,30 @@ if __name__ == "__main__":
         stable_base_vector = load_sweep_vector(dev_sweeps[first_available_idx], ref_freq=REF_FREQ, use_phase=USE_PHASE)
     else:
         stable_base_vector = np.random.randn(len(REF_FREQ) * (2 if USE_PHASE else 1))
-    scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_A"
+    scenario = sys.argv[1]
     sweep_idx = 1
     aging_drift = 0.0
     alpha = 0.005
     try:
         while True:
-            # SIMULATION FIX: Use the locked hardware base vector and add simulated thermal noise.
-            # This prevents massive PCA bit-flipping caused by swapping completely different sweep files.
-            noise = np.random.normal(0, 0.0, len(stable_base_vector))
-            thermal_noise = np.random.normal(0, 0.01, len(stable_base_vector))
-            real_sweep = stable_base_vector + noise
+            # 1. Base Hardware Readout with realistic thermal noise
+            thermal_noise = np.random.normal(0, 0.0005, len(stable_base_vector))
+            real_sweep = stable_base_vector + thermal_noise
             k_auth, k_health = node.transform_hardware_sweep(real_sweep)
+            
+            current_health = list(k_health)
+
+            # 2. SCENARIO ISOLATION LOGIC
             if scenario == "Scenario_A":
                 # Apply continuous natural aging
                 current_health = [val + (aging_drift / np.sqrt(32)) for val in k_health]
                 aging_drift += alpha
 
             elif scenario == "Scenario_C" and sweep_idx >= 30:
-                current_health = [val + 5.0 for val in k_health]           
+                # Apply malicious cyber injection halfway through
+                current_health = [val + 5.0 for val in k_health]
+
+            # 3. Transmit the resulting payload
             node.transmit(k_auth, current_health, telemetry_val=float(sweep_idx))
             
             sweep_idx += 1

@@ -156,7 +156,7 @@ int main(int argc, char *argv[]) {
     GlobalValue::Bind ("SimulatorImplementationType", StringValue ("ns3::RealtimeSimulatorImpl"));
     
     // Dynamic command-line argument configuration
-    std::string scenario = "Scenario_A"; // Default fallback
+    std::string scenario;
     CommandLine cmd;
     cmd.AddValue("scenario", "The evaluation profile to run (Scenario_A, Scenario_B, Scenario_C)", scenario);
     cmd.Parse(argc, argv);
