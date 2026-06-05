@@ -120,15 +120,19 @@ def generate_roc_curve():
         return
 
     df = df.dropna(subset=['Time', 'Innovation', 'Dynamic_Threshold'])
+    
+    # 1. Give the Kalman Filter 15 seconds to fully initialize
+    df = df[df['Time'] > 15.0].copy()
+
     if len(df) < 50: return
 
-    # 1. Reconstruct exact NIS score
+    # 2. Reconstruct exact NIS score
     df['NIS'] = 9.0 * (df['Innovation'] / df['Dynamic_Threshold'])**2
     
-    # 2. FIXED GROUND TRUTH: The attack starts at t=30s and lasts forever
+    # 3. FIXED GROUND TRUTH: The attack starts at t=30s and lasts forever
     df['Ground_Truth'] = (df['Time'] >= 30.0).astype(int)
         
-    # 3. Calculate standard ROC
+    # 4. Calculate standard ROC curve
     fpr, tpr, thresholds = roc_curve(df['Ground_Truth'], df['NIS'])
     roc_auc = auc(fpr, tpr)
 
@@ -141,17 +145,26 @@ def generate_roc_curve():
     plt.ylabel('True Positive Rate (DR)')
     plt.title('Receiver Operating Characteristic (ROC)', fontsize=11, fontweight='bold')
     
-    # Plot our chosen operating point (NIS Threshold = 9.0)
-    chosen_idx = np.argmin(np.abs(thresholds - 9.0))
-    plt.scatter(fpr[chosen_idx], tpr[chosen_idx], color="red", s=60, zorder=5, label="Operating Point (τ=9.0)")
+    # ==========================================
+    # FIX: CALCULATE EXACT OPERATING POINT MANUALLY
+    # ==========================================
+    fp = len(df[(df['NIS'] >= 9.0) & (df['Ground_Truth'] == 0)])
+    tn = len(df[(df['NIS'] < 9.0) & (df['Ground_Truth'] == 0)])
+    tp = len(df[(df['NIS'] >= 9.0) & (df['Ground_Truth'] == 1)])
+    fn = len(df[(df['NIS'] < 9.0) & (df['Ground_Truth'] == 1)])
     
+    actual_far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    actual_dr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    
+    plt.scatter(actual_far, actual_dr, color="red", s=60, zorder=5, label=r"Operating Point ($\tau=9.0$)")
+    # ==========================================
+
     plt.legend(loc="lower right", fontsize=9)
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
     plt.savefig("Fig_IDS_ROC_Curve.pdf", dpi=300)
     plt.close()
     print(f"📊 Generated Fig_IDS_ROC_Curve.pdf (AUC: {roc_auc:.4f})")
-
 def generate_network_overhead_plot():
     try:
         df = pd.read_csv("telemetry_Scenario_B.csv")
