@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <fcntl.h> 
 #include "ns3/waypoint-mobility-model.h"
+#include <string>
 
 using namespace ns3;
 
@@ -78,10 +79,12 @@ public:
     AnastaReceiverApp() : m_hostSendTwinFd(-1) {}
     virtual ~AnastaReceiverApp() {}
 
-    void Setup(uint16_t twinPort, Ptr<Node> uavNode, Ptr<Node> jammerNode) {
+    // Updated Setup signature to accept the scenario tracking string
+    void Setup(uint16_t twinPort, Ptr<Node> uavNode, Ptr<Node> jammerNode, std::string scenario) {
         m_twinPort = twinPort;
         m_uavNode = uavNode;
         m_jammerNode = jammerNode;
+        m_scenario = scenario; 
 
         m_hostSendTwinFd = socket(AF_INET, SOCK_DGRAM, 0);
         m_twinAddr.sin_family = AF_INET;
@@ -109,29 +112,32 @@ private:
             uint8_t* buffer = new uint8_t[pSize];
             packet->CopyData(buffer, pSize);
 
-            // Fetch the base MobilityModel safely
             Ptr<MobilityModel> uavMob = m_uavNode->GetObject<MobilityModel>();
             Ptr<MobilityModel> jammerMob = m_jammerNode->GetObject<MobilityModel>();
             double distance = uavMob->GetDistanceFrom(jammerMob);
-	    if (pSize > 14 && distance < 30.0) {
+
+            // CONDITIONAL EXPERIMENTAL CHECK: Only execute jamming simulation in Scenario B!
+            if (m_scenario == "Scenario_B" && pSize > 14 && distance < 30.0) {
                 double dropProbability = 100.0 * (1.0 - (distance / 30.0) * (distance / 30.0));
                 
-                // 1. SIMULATE ERASURE
+                // 1. SIMULATE ERASURE (Drop Packet)
                 if ((rand() % 100) < dropProbability) {
                     std::cout << "[ns-3] 💥 JAMMER DESTROYED PACKET! (Dist: " << distance << "m | Drop Prob: " << dropProbability << "%)" << std::endl;
                     delete[] buffer;
                     continue; 
                 }
                 
-                // 2. SIMULATE CORRUPTION: Packet survived, but payload gets corrupted
+                // 2. SIMULATE CORRUPTION (Flip Bit)
                 uint32_t max_corrupt_len = (pSize - 14 < 16) ? (pSize - 14) : 16;
-		uint32_t corruptIdx = 14 + (rand() % max_corrupt_len);
+                uint32_t corruptIdx = 14 + (rand() % max_corrupt_len);
                 buffer[corruptIdx] ^= 0xFF; 
                 std::cout << "[ns-3] ⚡ JAMMER CORRUPTED PACKET! Distance: " << distance << "m." << std::endl;
             } else {
+                // In Scenario A and Scenario C, the channel behaves flawlessly
                 std::cout << "[ns-3] ✅ Packet passed cleanly. Distance: " << distance << "m." << std::endl;
             }
 
+            // Forward telemetry to the local Digital Twin Server
             sendto(m_hostSendTwinFd, buffer, pSize, 0, (struct sockaddr*)&m_twinAddr, sizeof(m_twinAddr));
             delete[] buffer;
         }
@@ -143,12 +149,21 @@ private:
     Ptr<Socket> m_ns3Socket;
     Ptr<Node> m_uavNode;
     Ptr<Node> m_jammerNode;
+    std::string m_scenario; 
 };
 
 int main(int argc, char *argv[]) {
     GlobalValue::Bind ("SimulatorImplementationType", StringValue ("ns3::RealtimeSimulatorImpl"));
+    
+    // Dynamic command-line argument configuration
+    std::string scenario = "Scenario_A"; // Default fallback
     CommandLine cmd;
+    cmd.AddValue("scenario", "The evaluation profile to run (Scenario_A, Scenario_B, Scenario_C)", scenario);
     cmd.Parse(argc, argv);
+
+    std::cout << "==========================================================" << std::endl;
+    std::cout << "🚀 Real-Time Network Simulation Active: " << scenario << std::endl;
+    std::cout << "==========================================================" << std::endl;
 
     NodeContainer nodes;
     nodes.Create(3); 
@@ -173,7 +188,7 @@ int main(int argc, char *argv[]) {
     nodes.Get(1)->GetObject<MobilityModel>()->SetPosition(Vector(50.0, 0.0, 0.0));
     nodes.Get(2)->GetObject<MobilityModel>()->SetPosition(Vector(50.0, 0.0, 0.0));
 
-    // Set UAV (Node 0) to a Waypoint Patrol Path (Flies back and forth at 1 m/s)
+    // Set UAV (Node 0) to a Waypoint Patrol Path (Flies back and forth)
     MobilityHelper uavMobHelper;
     uavMobHelper.SetMobilityModel("ns3::WaypointMobilityModel");
     uavMobHelper.Install(nodes.Get(0));
@@ -201,12 +216,12 @@ int main(int argc, char *argv[]) {
     sender->SetStopTime(Seconds(300.0));
 
     Ptr<AnastaReceiverApp> receiver = CreateObject<AnastaReceiverApp>();
-    receiver->Setup(5000, nodes.Get(0), nodes.Get(2));
+    // Pass the scenario variable directly into the Receiver Application instance
+    receiver->Setup(5000, nodes.Get(0), nodes.Get(2), scenario);
     nodes.Get(1)->AddApplication(receiver);
     receiver->SetStartTime(Seconds(0.0));
     receiver->SetStopTime(Seconds(300.0));
 
-    std::cout << "🚀 Real-Time Network Simulation Active. Duration: 300s" << std::endl;
     Simulator::Stop(Seconds(300.0)); 
     Simulator::Run();
     Simulator::Destroy();

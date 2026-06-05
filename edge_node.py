@@ -8,7 +8,7 @@ from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-
+import sys
 # Natively bind parameters directly from your project's final_pca.py
 try:
     from final_pca import (
@@ -186,17 +186,26 @@ if __name__ == "__main__":
         stable_base_vector = load_sweep_vector(dev_sweeps[first_available_idx], ref_freq=REF_FREQ, use_phase=USE_PHASE)
     else:
         stable_base_vector = np.random.randn(len(REF_FREQ) * (2 if USE_PHASE else 1))
-
+    scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_A"
     sweep_idx = 1
+    aging_drift = 0.0
+    alpha = 0.005
     try:
         while True:
             # SIMULATION FIX: Use the locked hardware base vector and add simulated thermal noise.
             # This prevents massive PCA bit-flipping caused by swapping completely different sweep files.
             noise = np.random.normal(0, 0.0, len(stable_base_vector))
+            thermal_noise = np.random.normal(0, 0.01, len(stable_base_vector))
             real_sweep = stable_base_vector + noise
-
             k_auth, k_health = node.transform_hardware_sweep(real_sweep)
-            node.transmit(k_auth, k_health, telemetry_val=float(sweep_idx))
+            if scenario == "Scenario_A":
+                # Apply continuous natural aging
+                current_health = [val + (aging_drift / np.sqrt(32)) for val in k_health]
+                aging_drift += alpha
+
+            elif scenario == "Scenario_C" and sweep_idx >= 30:
+                current_health = [val + 5.0 for val in k_health]           
+            node.transmit(k_auth, current_health, telemetry_val=float(sweep_idx))
             
             sweep_idx += 1
             time.sleep(1.0)

@@ -7,9 +7,10 @@ from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from filterpy.kalman import KalmanFilter
 from collections import deque
+import sys
 
 class DigitalTwinServer:
-    def __init__(self, listen_ip="127.0.0.1", listen_port=5000, feedback_ip="127.0.0.1", feedback_port=9001, master_key=b'\x00'*16, salt=b'\x01'*4):
+    def __init__(self, scenario_name="Scenario_A", listen_ip="127.0.0.1", listen_port=5000, feedback_ip="127.0.0.1", feedback_port=9001, master_key=b'\x00'*16, salt=b'\x01'*4):
         self.rx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rx_sock.bind((listen_ip, listen_port))
         
@@ -45,13 +46,19 @@ class DigitalTwinServer:
         self.kf.Q = np.array([[0.01]])  
 
         self.start_time = time.time()
-        self.log_file = open("thesis_telemetry_log.csv", "w", newline='')
+        self.log_filename = f"telemetry_{scenario_name}.csv"
+        self.log_file = open(self.log_filename, "w", newline='')
         self.csv_writer = csv.writer(self.log_file)
-        self.csv_writer.writerow(["Time", "Seq", "Tier", "PDR", "Hamming_Distance", "Kalman_State", "Innovation", "Threshold_Alarm", "Alarm_Type"])
+        
+        # 10 Columns matching your academic plotting requirements
+        self.csv_writer.writerow([
+            "Time", "Seq", "Tier", "PDR", "Hamming_Distance", 
+            "Raw_Measurement", "Kalman_State", "Innovation", 
+            "Dynamic_Threshold", "Alarm_Active"
+        ])
         self.log_file.flush()
 
     def _generate_crypto_masks(self, seq):
-        CRYPTO_MODE = "SEQUENCE" 
         val_n = seq
         val_s = seq
 
@@ -96,9 +103,7 @@ class DigitalTwinServer:
         pdr = sum(self.pdr_window) / max(1, len(self.pdr_window))
         self.tx_sock.sendto(struct.pack(">f", pdr), self.feedback_address)
 
-        # ---------------------------------------------------------
         # SECTION 5.2: PDR-COUPLED STATE ESTIMATION INFLATION
-        # ---------------------------------------------------------
         R_base = 0.1   
         alpha = 5.0    
         self.kf.R = np.array([[R_base + alpha * (1.0 - pdr)]])
@@ -107,7 +112,6 @@ class DigitalTwinServer:
         hd = 0
         innovation = 0.0
         alarm_triggered = 0
-        alarm_type = "None" # Classify the type of attack
 
         if tier_id == 1:
             p_auth = payload[:16]
@@ -116,7 +120,6 @@ class DigitalTwinServer:
             k_auth_rec = bytes(a ^ b for a, b in zip(p_auth, n_i))
             rec_bits = np.unpackbits(np.frombuffer(k_auth_rec, dtype=np.uint8))
             
-            # Safe unpack: Only unpack if we received the full 128 bytes of health
             if len(p_health_bytes) == 128:
                 k_health_rec = np.array(struct.unpack(">32f", p_health_bytes))
             else:
@@ -136,29 +139,28 @@ class DigitalTwinServer:
             self.kf.predict()
             innovation = float(health_drift - self.kf.x[0, 0])
             
-            # 3. Kalman State Update
-            self.kf.update(np.array([[health_drift]]))
-            
-            # 4. Dynamic Threshold Calculation (Derived from Innovation Covariance S)
-            threshold = float(3.0 * np.sqrt(self.kf.S[0, 0]))
-            
-            # 5. ALARM CLASSIFICATION LOGIC (Fixes the plotting bug)
+            # 3. Establish Safe Mathematical Bounds Before Updating State
+            S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
+            threshold = float(3.0 * np.sqrt(S_pre))           
+
+            # 4. Alarm Classification Logic
             if abs(innovation) > threshold:
                 print(f"   🚨 ALARM: Physical Health Anomaly! (Innovation: {abs(innovation):.2f} > Threshold: {threshold:.2f})")
                 alarm_triggered = 1
-                alarm_type = "Kalman_Anomaly"
             elif hd > 5:
                 print(f"   🚨 ALARM: Identity Spoofing Detected! (Hamming Distance: {hd})")
-                # To make the plot look correct for an identity attack, we artificially spike the innovation log 
-                # so the red X shows up outside the bounds on the graph.
                 innovation = threshold + 2.0 
                 alarm_triggered = 1
-                alarm_type = "Identity_Spoof"
             else:
-                pass # Normal operation
+                self.kf.update(np.array([[health_drift]]))
             
+            # 5. INTEGRATED ACADEMIC LOGGING ROW PLACEMENT
             t_elapsed = time.time() - self.start_time
-            self.csv_writer.writerow([t_elapsed, seq, tier_id, pdr, hd, self.kf.x[0,0], innovation, alarm_triggered, alarm_type])
+            self.csv_writer.writerow([
+                t_elapsed, seq, tier_id, pdr, hd, 
+                health_drift, self.kf.x[0,0], innovation, 
+                threshold, alarm_triggered
+            ])
             self.log_file.flush()
                 
         elif tier_id == 2:
@@ -194,10 +196,14 @@ class DigitalTwinServer:
                 
                 if abs(innovation) > threshold:
                     alarm_triggered = 1
-                    alarm_type = "Tier2_Kalman_Anomaly"
 
                 t_elapsed = time.time() - self.start_time
-                self.csv_writer.writerow([t_elapsed, seq, tier_id, pdr, hd, self.kf.x[0,0], innovation, alarm_triggered, alarm_type])
+                # For Tier 2, map hd as the raw physical estimation backup
+                self.csv_writer.writerow([
+                    t_elapsed, seq, tier_id, pdr, hd, 
+                    float(hd), self.kf.x[0,0], innovation, 
+                    threshold, alarm_triggered
+                ])
                 self.log_file.flush()
 
     def start(self):
@@ -213,5 +219,7 @@ class DigitalTwinServer:
             self.tx_sock.close()
 
 if __name__ == "__main__":
+    scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_A"
+    print(f"🚀 Launching Digital Twin for: {scenario}")
     server = DigitalTwinServer()
     server.start()
