@@ -37,6 +37,8 @@ class AnastaEdgeNode:
         self.salt = salt
         self.sequence_counter = 0
         self.current_tier = 1  
+        self.PDR_DROP_THRESHOLD = 0.75     # Breakpoint to drop into Fountain mode
+        self.PDR_RECOVER_THRESHOLD = 0.85  # Breakpoint to recover to Hi-Fi mode
         
         self.n_identity = 128
         self.n_health = 32
@@ -100,12 +102,17 @@ class AnastaEdgeNode:
             try:
                 data, _ = self.feedback_sock.recvfrom(1024)
                 pdr = struct.unpack(">f", data)[0]
-                if self.current_tier == 1 and pdr < 0.80:
-                    self.current_tier = 2
-                    print(f"🚨 PDR Dropped to {pdr:.2f}. Switching to Tier 2 Fountain Mode.")
-                elif self.current_tier == 2 and pdr >= 0.95:
-                    self.current_tier = 1
-                    print(f"🟢 PDR Recovered to {pdr:.2f}. Switching to Tier 1 High-Fidelity Mode.")
+                
+                if self.current_tier == 1:
+                    if pdr < self.PDR_DROP_THRESHOLD:
+                        self.current_tier = 2
+                        print(f"🚨 PDR Dropped to {pdr:.2f} (< {self.PDR_DROP_THRESHOLD}). Switching to Tier 2 Fountain Mode.")
+                
+                elif self.current_tier == 2:
+                    if pdr > self.PDR_RECOVER_THRESHOLD:
+                        self.current_tier = 1
+                        print(f"🟢 PDR Recovered to {pdr:.2f} (> {self.PDR_RECOVER_THRESHOLD}). Switching to Tier 1 High-Fidelity Mode.")
+                        
             except Exception:
                 break
 
@@ -121,11 +128,24 @@ class AnastaEdgeNode:
         return n_i, s_i
 
     def _fountain_compress(self, data_bytes, mask_bytes):
+        # TRUE LT ENCODER: Using degree distribution (Soliton-inspired)
         seed = int.from_bytes(mask_bytes, byteorder='big')
         rng = np.random.default_rng(seed)
-        indices = rng.choice(128, size=32, replace=False)
         bits = np.unpackbits(np.frombuffer(data_bytes, dtype=np.uint8))
-        return np.packbits(bits[indices]).tobytes()
+        
+        encoded_bits = np.zeros(32, dtype=np.uint8)
+        degree_choices = [1, 2, 3, 4]
+        degree_probs = [0.20, 0.50, 0.15, 0.15]
+        
+        for i in range(32):
+            d = rng.choice(degree_choices, p=degree_probs)
+            indices = rng.choice(128, size=d, replace=False)
+            val = 0
+            for idx in indices:
+                val ^= bits[idx]  # XOR the multiple source bits
+            encoded_bits[i] = val
+            
+        return np.packbits(encoded_bits).tobytes()
 
     def transform_hardware_sweep(self, raw_sweep_vector):
         scaled = self.scaler.transform(raw_sweep_vector.reshape(1, -1))
@@ -134,30 +154,35 @@ class AnastaEdgeNode:
         w_high = proj[:self.n_identity]
         w_low = proj[self.n_identity:self.total_components]
         
-        # FIXED: Honest extraction. Real hardware noise will now cause natural bit flips near 0.
         current_bits = np.where(w_high > 0, 1, 0).astype(np.uint8)
-        
         k_auth = np.packbits(current_bits).tobytes()
         k_health = w_low.tolist()
         return k_auth, k_health
 
     def transmit(self, k_auth, k_health, telemetry_val=22.4):
-        n_i, s_i = self._generate_crypto_masks(self.sequence_counter)
-        header = struct.pack(">IIBfB", int(time.time()) & 0xFFFFFFFF, self.sequence_counter, self.current_tier, telemetry_val, 0)
-        
-        if self.current_tier == 1:
-            p_auth = bytes(a ^ b for a, b in zip(k_auth, n_i))
-            p_health = struct.pack(">32f", *k_health)
-            packet = header + p_auth + p_health
-        else:
-            k_auth_comp = self._fountain_compress(k_auth, s_i)
-            n_i_comp = self._fountain_compress(n_i, s_i)
-            p_fountain = bytes(a ^ b for a, b in zip(k_auth_comp, n_i_comp))
-            packet = header + p_fountain
+            n_i, s_i = self._generate_crypto_masks(self.sequence_counter)
+            header = struct.pack(">IIBfB", int(time.time()) & 0xFFFFFFFF, self.sequence_counter, self.current_tier, telemetry_val, 0)
             
-        self.tx_sock.sendto(packet, self.ns3_address)
-        print(f"[Edge] Sent Seq {self.sequence_counter} | Tier {self.current_tier} | Size: {len(packet)}B")
-        self.sequence_counter += 1
+            if self.current_tier == 1:
+                # 1. SATURATION GUARD: Clip state values to standard 32-bit float limits
+                MAX_FLOAT32 = 3.4028235e38
+                MIN_FLOAT32 = -3.4028235e38
+                sanitized_health = [max(MIN_FLOAT32, min(MAX_FLOAT32, float(x))) for x in k_health]
+                
+                p_auth = bytes(a ^ b for a, b in zip(k_auth, n_i))
+                
+                # 2. PACK SANITIZED VALUES: Safe from OverflowErrors
+                p_health = struct.pack(">32f", *sanitized_health)
+                packet = header + p_auth + p_health
+            else:
+                k_auth_comp = self._fountain_compress(k_auth, s_i)
+                n_i_comp = self._fountain_compress(n_i, s_i)
+                p_fountain = bytes(a ^ b for a, b in zip(k_auth_comp, n_i_comp))
+                packet = header + p_fountain
+                
+            self.tx_sock.sendto(packet, self.ns3_address)
+            print(f"[Edge] Sent Seq {self.sequence_counter} | Tier {self.current_tier} | Size: {len(packet)}B")
+            self.sequence_counter += 1
 
     def close(self):
         self.running = False
@@ -177,24 +202,45 @@ if __name__ == "__main__":
         
     scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_A"
     sweep_idx = 1
-    aging_drift = 0.0
-    alpha = 0.005
+    stealth_drift = 0.0
+    
     try:
         while True:
-            # Base Hardware Readout with realistic thermal noise
+            # 1. Base Hardware Readout with realistic thermal noise
             thermal_noise = np.random.normal(0, 0.0005, len(stable_base_vector))
             real_sweep = stable_base_vector + thermal_noise
             k_auth, k_health = node.transform_hardware_sweep(real_sweep)
             current_health = list(k_health)
 
-            if scenario == "Scenario_A":
-                current_health = [val + (aging_drift / np.sqrt(32)) for val in k_health]
-                aging_drift += alpha
-            elif scenario == "Scenario_C" and sweep_idx >= 30:
-                current_health = [val + 5.0 for val in k_health]
+            # ==========================================================
+            # TIME SCALING: Convert raw iterations into real elapsed seconds
+            # ==========================================================
+            dt = 0.00015 
+            elapsed_time = sweep_idx * dt
 
-            node.transmit(k_auth, current_health, telemetry_val=float(sweep_idx))
-            sweep_idx += 1
-            time.sleep(1.0)
+            # 2. SCENARIO ISOLATION LOGIC (Scientifically Rigorous Profiles)
+            if scenario == "Scenario_A":
+                # FIXED: Use elapsed_time so the curve grows over real seconds, not milliseconds
+                aging_drift = 0.002 * (np.exp(0.015 * elapsed_time) - 1.0)
+                current_health = [val + (aging_drift / np.sqrt(32)) for val in k_health]
+
+            elif scenario == "Scenario_C":
+                # FIXED: Wait for 30 real seconds, then add drift scaled by dt
+                if elapsed_time >= 30.0:
+                    stealth_drift += (0.015 * dt) 
+                    current_health = [val + (stealth_drift / np.sqrt(32)) for val in k_health]
+
+            try:
+                # Your existing transmission line (Line 218)
+                node.transmit(k_auth, current_health, telemetry_val=float(elapsed_time))
+                sweep_idx += 1
+                
+                # Keep our high-speed 1ms pacing
+                time.sleep(0.001)
+
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Catch the socket closure when NS-3 finishes unthrottled execution
+                print("🔌 NS-3 simulation socket closed. Terminating edge node loop cleanly.")
+                break
     except KeyboardInterrupt:
         node.close()

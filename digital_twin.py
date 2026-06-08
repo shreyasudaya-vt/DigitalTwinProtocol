@@ -24,23 +24,27 @@ class DigitalTwinServer:
         self.window_size = 40
         self.pdr_window = deque(maxlen=self.window_size)
         self.last_seq = -1
-        
+        self.is_locked_out=False
+
+        self.consecutive_anomalies = 0
         self.is_enrolled = False
         self.baseline_k_auth_bits = None
         self.baseline_k_health = None
 
-        self.reconstruction_buffer = np.zeros(128, dtype=np.float32)
-        self.hit_counts = np.zeros(128, dtype=np.int32)
-        self.received_packets_since_tier_drop = 0 # FIXED: Initialization added
+        self.received_packets_since_tier_drop = 0
+        self.bp_graph = []       
+        self.resolved_bits = {}
         
         self.kf = KalmanFilter(dim_x=2, dim_z=1)
-        self.kf.x = np.array([[0.0], [0.005]])
-        self.kf.F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        self.kf.x = np.array([[0.0], [0.0]])
+        dt = 0.00015
+        self.kf.F = np.array([[1.0, dt], [0.0, 1.0]])
         self.kf.H = np.array([[1.0, 0.0]])
         
         self.kf.P = np.array([[0.01, 0.0], [0.0, 1e-4]])
         self.kf.R = np.array([[0.002]]) 
-        self.kf.Q = np.diag([1e-4, 1e-7])
+        self.kf.Q = np.diag([1e-2, 1e-2])
+    
  
         self.warmup_count = 0
         self.WARMUP_PACKETS = 25
@@ -67,15 +71,43 @@ class DigitalTwinServer:
         s_i = cipher_s.encrypt(b'\x00' * 4)
         return n_i, s_i
 
-    def _fountain_decompress_indices(self, mask_bytes):
+    def _fountain_compress(self, data_bytes, mask_bytes):
+        seed = int.from_bytes(mask_bytes, byteorder='big')
+        rng = np.random.default_rng(seed)
+        bits = np.unpackbits(np.frombuffer(data_bytes, dtype=np.uint8))
+        encoded_bits = np.zeros(32, dtype=np.uint8)
+        degree_choices = [1, 2, 3, 4]
+        degree_probs = [0.20, 0.50, 0.15, 0.15]
+        for i in range(32):
+            d = rng.choice(degree_choices, p=degree_probs)
+            indices = rng.choice(128, size=d, replace=False)
+            val = 0
+            for idx in indices:
+                val ^= bits[idx]
+            encoded_bits[i] = val
+        return np.packbits(encoded_bits).tobytes()
+
+    def _fountain_decompress_graph(self, mask_bytes):
         seed = int.from_bytes(mask_bytes, byteorder="big")
         rng = np.random.default_rng(seed)
-        return rng.choice(128, size=32, replace=False)
+        degree_choices = [1, 2, 3, 4]
+        degree_probs = [0.20, 0.50, 0.15, 0.15]
+        graph = []
+        for _ in range(32):
+            d = rng.choice(degree_choices, p=degree_probs)
+            indices = rng.choice(128, size=d, replace=False)
+            graph.append(set(indices))
+        return graph
 
     def process_packet(self, data):
         if len(data) < 14: return
 
         timestamp, seq, tier_id, telemetry, reserved = struct.unpack(">IIBfB", data[:14])
+        
+        if self.last_seq != -1 and seq <= self.last_seq:
+            print(f"   🚨 ALARM: Replay Attack Detected! (Seq {seq} <= {self.last_seq})")
+            return
+            
         payload = data[14:]
 
         self.received_packets += 1
@@ -92,13 +124,15 @@ class DigitalTwinServer:
         pdr = sum(self.pdr_window) / max(1, len(self.pdr_window))
         self.tx_sock.sendto(struct.pack(">f", pdr), self.feedback_address)
 
-        R_base = 0.0001 
+        R_base = 0.002 
         alpha_noise = 5.0
         self.kf.R = np.array([[R_base + alpha_noise * (1.0 - pdr)]])
 
         n_i, s_i = self._generate_crypto_masks(seq)
 
         if tier_id == 1:
+            self.bp_graph = []
+            self.resolved_bits = {}
             self.received_packets_since_tier_drop = 0
             p_auth = payload[:16]
             p_health_bytes = payload[16:144]
@@ -126,82 +160,133 @@ class DigitalTwinServer:
             nis = (innovation ** 2) / S_pre
             threshold = float(3.0 * np.sqrt(S_pre))
             alarm_triggered = 0
-
-            if self.warmup_count < self.WARMUP_PACKETS:
-                self.warmup_count += 1
+            if telemetry < 25.0:
                 self.kf.update(np.array([[health_drift]]))
+                self.consecutive_anomalies = 0
+                alarm_triggered = 0
+                self.is_locked_out = False
+            
+            # --- 2. Active Monitoring Period ---
             else:
-                if hd > 8:
+                # If a persistent attack was already confirmed, hold the line
+                if self.is_locked_out:
+                    alarm_triggered = 1
+                    # Coast safely without ingestion
+                
+                elif hd > 8:
                     print(f"   🚨 ALARM: Identity Spoofing Detected! (Hamming Distance: {hd})")
                     alarm_triggered = 1
-                elif nis > 9.0:
-                    print(f"   🚨 ALARM: Physical Health Anomaly! (NIS: {nis:.2f} > 9.0)")
-                    alarm_triggered = 1
+                    # Coast mode to protect the matrix
+                    
+                # 🌟 FIX: Use the true dynamic 3-sigma threshold instead of a rigid NIS constant
+                elif abs(innovation) > threshold:
+                    self.consecutive_anomalies += 1
+                    print(f"   ⚠️ Transient Anomaly Alert (Innov: {abs(innovation):.4f} > {threshold:.4f}) | Counter: {self.consecutive_anomalies}/5")
+                    
+                    if self.consecutive_anomalies > 5:
+                        print(f"   🚨 ALARM: Persistent Physical Health Anomaly Confirmed!")
+                        self.is_locked_out = True
+                        alarm_triggered = 1
+                    else:
+                        alarm_triggered = 0  # Defensive coasting
+                        
                 else:
+                    # --- 3. Clean & Healthy State ---
+                    self.consecutive_anomalies = 0
                     self.kf.update(np.array([[health_drift]]))
-
+                    alarm_triggered = 0
             self.csv_writer.writerow([
-                time.time() - self.start_time, seq, tier_id, pdr, hd,
+                telemetry, seq, tier_id, pdr, hd,
                 health_drift, float(self.kf.x[0, 0]), float(self.kf.P[0, 0]),
                 innovation, threshold, alarm_triggered,
             ])
             self.log_file.flush()
 
         elif tier_id == 2:
+            self.received_packets_since_tier_drop += 1
             p_fountain = payload[:4]
-            fountain_indices = self._fountain_decompress_indices(s_i)
-            n_i_bits = np.unpackbits(np.frombuffer(n_i, dtype=np.uint8))
-            p_fountain_bits = np.unpackbits(np.frombuffer(p_fountain, dtype=np.uint8))
+            
+            fountain_graph = self._fountain_decompress_graph(s_i)
+            n_i_comp = self._fountain_compress(n_i, s_i)
+            received_lt_symbols = bytes(a ^ b for a, b in zip(p_fountain, n_i_comp))
+            received_bits = np.unpackbits(np.frombuffer(received_lt_symbols, dtype=np.uint8))
 
-            for local_idx, global_idx in enumerate(fountain_indices):
-                received_bit = p_fountain_bits[local_idx]
-                mask_bit = n_i_bits[global_idx]
-                self.reconstruction_buffer[global_idx] += received_bit ^ mask_bit
-                self.hit_counts[global_idx] += 1
+            for i in range(32):
+                self.bp_graph.append({
+                    'value': received_bits[i],
+                    'indices': fountain_graph[i]
+                })
 
-            # 1. ALWAYS advance the physics prediction step
+            for node in self.bp_graph:
+                to_remove = []
+                for idx in node['indices']:
+                    if idx in self.resolved_bits:
+                        node['value'] ^= self.resolved_bits[idx]
+                        to_remove.append(idx)
+                for idx in to_remove:
+                    node['indices'].remove(idx)
+
+            progress = True
+            while progress:
+                progress = False
+                degree_1_nodes = [n for n in self.bp_graph if len(n['indices']) == 1]
+                
+                for node in degree_1_nodes:
+                    # FIXED: Check if a previous node's avalanche already emptied this node
+                    if len(node['indices']) != 1:
+                        continue
+                        
+                    idx = list(node['indices'])[0]
+                    if idx not in self.resolved_bits:
+                        val = node['value']
+                        self.resolved_bits[idx] = val
+                        progress=True
+                        for other_node in self.bp_graph:
+                            if idx in other_node['indices']:
+                                other_node['indices'].remove(idx)
+                                other_node['value'] ^= val
+                                
+                                
+                self.bp_graph = [n for n in self.bp_graph if len(n['indices']) > 0]
+
             self.kf.predict()
-            t_elapsed = time.time() - self.start_time
-            threshold = float(3.0 * np.sqrt(float(self.kf.P[0, 0])))
+            estimated_health = float(self.kf.x[0, 0])
+            threshold = float(5.0 * np.sqrt(float(self.kf.P[0, 0])))
 
-            unobserved = np.sum(self.hit_counts == 0)
+            unobserved = 128 - len(self.resolved_bits)
             if unobserved > 0:
-                # 2. FIXED: Log intermediate coasting steps honestly using np.nan 
-                # so plot.py can render the continuous curve and the telemetry gap
+                # FIXED: Use telemetry time
                 self.csv_writer.writerow([
-                    t_elapsed, seq, tier_id, pdr, -1,  # -1 indicates reconstruction pending
-                    np.nan, float(self.kf.x[0, 0]), float(self.kf.P[0, 0]),
-                    0.0, threshold, 0
+                    telemetry, seq, tier_id, pdr, -1, 
+                    np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, 0
                 ])
                 self.log_file.flush()
                 return
 
-            if unobserved == 0 and self.hit_counts.max() == 1: 
-                print(f"📊 Tier 2 Reconstruction Successful! Packets required: {self.received_packets_since_tier_drop}")
-
-            final_bits = np.where((self.reconstruction_buffer / self.hit_counts) >= 0.5, 1, 0).astype(np.uint8)
+            print(f"📊 LT Belief Propagation Avalanche Complete! Packets required: {self.received_packets_since_tier_drop}")
+            
+            final_bits = np.zeros(128, dtype=np.uint8)
+            for idx in range(128):
+                final_bits[idx] = self.resolved_bits[idx]
 
             if not self.is_enrolled:
                 self.baseline_k_auth_bits = np.copy(final_bits)
                 self.is_enrolled = True
 
             hd = int(np.sum(final_bits != self.baseline_k_auth_bits))
-            estimated_health = float(self.kf.x[0, 0])
-            innovation = 0.0
+            alarm_triggered = 1 if (self.warmup_count >= self.WARMUP_PACKETS and hd > 8) else 0
 
-            if self.warmup_count >= self.WARMUP_PACKETS and hd > 8:
-                alarm_triggered = 1
-
-            # 3. FIXED: Raw_Measurement is logged as np.nan because this is an identity slot
+            # FIXED: Use telemetry time
             self.csv_writer.writerow([
-                t_elapsed, seq, tier_id, pdr, hd,
-                np.nan, estimated_health, float(self.kf.P[0, 0]),
-                innovation, threshold, alarm_triggered,
+                telemetry, seq, tier_id, pdr, hd,
+                np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, alarm_triggered,
             ])
             self.log_file.flush()
             
-            self.reconstruction_buffer.fill(0)
-            self.hit_counts.fill(0)
+            self.bp_graph = []
+            self.resolved_bits = {}
+            self.received_packets_since_tier_drop = 0
+
     def start(self):
         print("🟢 Digital Twin Monitoring Station Active...")
         try:
