@@ -31,27 +31,21 @@ class DigitalTwinServer:
 
         self.reconstruction_buffer = np.zeros(128, dtype=np.float32)
         self.hit_counts = np.zeros(128, dtype=np.int32)
+        self.received_packets_since_tier_drop = 0 # FIXED: Initialization added
+        
         self.kf = KalmanFilter(dim_x=2, dim_z=1)
         self.kf.x = np.array([[0.0], [0.005]])
-        self.kf.F = np.array([[1.0, 1.0],
-                              [0.0, 1.0]])
+        self.kf.F = np.array([[1.0, 1.0], [0.0, 1.0]])
         self.kf.H = np.array([[1.0, 0.0]])
         
-        # 1. Start with a tight initial covariance so there is no initial "megaphone" cone
-        self.kf.P = np.array([[0.01, 0.0],
-                              [0.0, 1e-4]])
-                              
-        self.kf.R = np.array([[0.002]])  # Base measurement noise (tuned for good tracking without alarms)
+        self.kf.P = np.array([[0.01, 0.0], [0.0, 1e-4]])
+        self.kf.R = np.array([[0.002]]) 
         self.kf.Q = np.diag([1e-4, 1e-7])
-        # self.kf.Q = (sigma_a**2) * np.array([
-        #     [dt**4 / 4,  dt**3 / 2],
-        #     [dt**3 / 2,  dt**2    ]
-        # ])
  
         self.warmup_count = 0
         self.WARMUP_PACKETS = 25
-
         self.start_time = time.time()
+        
         self.log_filename = f"telemetry_{scenario_name}.csv"
         self.log_file = open(self.log_filename, "w", newline="")
         self.csv_writer = csv.writer(self.log_file)
@@ -79,8 +73,7 @@ class DigitalTwinServer:
         return rng.choice(128, size=32, replace=False)
 
     def process_packet(self, data):
-        if len(data) < 14:
-            return
+        if len(data) < 14: return
 
         timestamp, seq, tier_id, telemetry, reserved = struct.unpack(">IIBfB", data[:14])
         payload = data[14:]
@@ -92,26 +85,21 @@ class DigitalTwinServer:
             diff = seq - self.last_seq
             if diff > 0:
                 missed = min(diff - 1, self.window_size)
-                for _ in range(missed):
-                    self.pdr_window.append(0)
+                for _ in range(missed): self.pdr_window.append(0)
                 self.pdr_window.append(1)
         self.last_seq = max(self.last_seq, seq)
 
         pdr = sum(self.pdr_window) / max(1, len(self.pdr_window))
         self.tx_sock.sendto(struct.pack(">f", pdr), self.feedback_address)
 
-        R_base = 0.002
-        alpha_noise = 5.0
         R_base = 0.0001 
         alpha_noise = 5.0
         self.kf.R = np.array([[R_base + alpha_noise * (1.0 - pdr)]])
 
         n_i, s_i = self._generate_crypto_masks(seq)
-        hd = 0
-        innovation = 0.0
-        alarm_triggered = 0
 
         if tier_id == 1:
+            self.received_packets_since_tier_drop = 0
             p_auth = payload[:16]
             p_health_bytes = payload[16:144]
 
@@ -133,32 +121,27 @@ class DigitalTwinServer:
             health_drift = float(np.linalg.norm(k_health_rec - self.baseline_k_health))
 
             self.kf.predict()
-
             innovation = float(health_drift - self.kf.x[0, 0])
             S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
             nis = (innovation ** 2) / S_pre
             threshold = float(3.0 * np.sqrt(S_pre))
+            alarm_triggered = 0
 
             if self.warmup_count < self.WARMUP_PACKETS:
                 self.warmup_count += 1
                 self.kf.update(np.array([[health_drift]]))
-                alarm_triggered = 0
             else:
-                # FIXED: Restored hybrid HD/NIS gating
                 if hd > 8:
                     print(f"   🚨 ALARM: Identity Spoofing Detected! (Hamming Distance: {hd})")
                     alarm_triggered = 1
-                    innovation = threshold + 2.0  
                 elif nis > 9.0:
                     print(f"   🚨 ALARM: Physical Health Anomaly! (NIS: {nis:.2f} > 9.0)")
                     alarm_triggered = 1
-                    innovation = threshold + 2.0  
                 else:
                     self.kf.update(np.array([[health_drift]]))
 
-            t_elapsed = time.time() - self.start_time
             self.csv_writer.writerow([
-                t_elapsed, seq, tier_id, pdr, hd,
+                time.time() - self.start_time, seq, tier_id, pdr, hd,
                 health_drift, float(self.kf.x[0, 0]), float(self.kf.P[0, 0]),
                 innovation, threshold, alarm_triggered,
             ])
@@ -176,11 +159,24 @@ class DigitalTwinServer:
                 self.reconstruction_buffer[global_idx] += received_bit ^ mask_bit
                 self.hit_counts[global_idx] += 1
 
+            # 1. ALWAYS advance the physics prediction step
+            self.kf.predict()
+            t_elapsed = time.time() - self.start_time
+            threshold = float(3.0 * np.sqrt(float(self.kf.P[0, 0])))
+
             unobserved = np.sum(self.hit_counts == 0)
             if unobserved > 0:
-                self.kf.predict()
+                # 2. FIXED: Log intermediate coasting steps honestly using np.nan 
+                # so plot.py can render the continuous curve and the telemetry gap
+                self.csv_writer.writerow([
+                    t_elapsed, seq, tier_id, pdr, -1,  # -1 indicates reconstruction pending
+                    np.nan, float(self.kf.x[0, 0]), float(self.kf.P[0, 0]),
+                    0.0, threshold, 0
+                ])
+                self.log_file.flush()
                 return
-            if unobserved == 0 and self.hit_counts.max() == 1: # Just hit full coverage
+
+            if unobserved == 0 and self.hit_counts.max() == 1: 
                 print(f"📊 Tier 2 Reconstruction Successful! Packets required: {self.received_packets_since_tier_drop}")
 
             final_bits = np.where((self.reconstruction_buffer / self.hit_counts) >= 0.5, 1, 0).astype(np.uint8)
@@ -190,27 +186,22 @@ class DigitalTwinServer:
                 self.is_enrolled = True
 
             hd = int(np.sum(final_bits != self.baseline_k_auth_bits))
-
-            self.kf.predict()
             estimated_health = float(self.kf.x[0, 0])
-            threshold = float(3.0 * np.sqrt(float(self.kf.P[0, 0])))
             innovation = 0.0
 
             if self.warmup_count >= self.WARMUP_PACKETS and hd > 8:
                 alarm_triggered = 1
 
-            t_elapsed = time.time() - self.start_time
+            # 3. FIXED: Raw_Measurement is logged as np.nan because this is an identity slot
             self.csv_writer.writerow([
                 t_elapsed, seq, tier_id, pdr, hd,
-                estimated_health, estimated_health, float(self.kf.P[0, 0]),
+                np.nan, estimated_health, float(self.kf.P[0, 0]),
                 innovation, threshold, alarm_triggered,
             ])
             self.log_file.flush()
             
-            # FIXED: Reset reconstruction buffer to prevent infinite P inflation
             self.reconstruction_buffer.fill(0)
             self.hit_counts.fill(0)
-
     def start(self):
         print("🟢 Digital Twin Monitoring Station Active...")
         try:
