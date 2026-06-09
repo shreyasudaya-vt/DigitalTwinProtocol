@@ -112,7 +112,7 @@ private:
 // ── 2. RECEIVER APPLICATION (installed on Base Station – Node 1) ──────────────
 class AnastaReceiverApp : public Application {
 public:
-    AnastaReceiverApp() : m_hostSendTwinFd(-1) {}
+    AnastaReceiverApp() : m_hostSendTwinFd(-1), m_smoothedPdr(1.0) {}
     virtual ~AnastaReceiverApp() {}
 
     void Setup(uint16_t twinPort, Ptr<Node> uavNode, Ptr<Node> jammerNode, std::string scenario) {
@@ -126,12 +126,14 @@ public:
         m_twinAddr.sin_port        = htons(m_twinPort);
         m_twinAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-        // FIX: use ns-3's seeded, reproducible RNG instead of rand().
-        //      rand() is not seeded and is not controlled by ns-3's RNG framework,
-        //      making results non-reproducible across runs.
         m_rng = CreateObject<UniformRandomVariable>();
         m_rng->SetAttribute("Min", DoubleValue(0.0));
         m_rng->SetAttribute("Max", DoubleValue(1.0));
+        
+        // Advanced: Normal Distribution for Shadowing Variance (Outdoor Environment)
+        m_shadowingRng = CreateObject<NormalRandomVariable>();
+        m_shadowingRng->SetAttribute("Mean", DoubleValue(0.0));
+        m_shadowingRng->SetAttribute("Variance", DoubleValue(4.0)); // 2 dB standard deviation shadowing
     }
 
 protected:
@@ -154,29 +156,22 @@ private:
             uint8_t* buffer = new uint8_t[pSize];
             packet->CopyData(buffer, pSize);
 
-            bool forward = true; // tracks whether buffer is still live
+            bool forward = true;
 
             if (m_scenario == "Scenario_B") {
-                // ── SINR-based jammer channel model ──────────────────────────
-                //
-                // FIX 1 – Geometry: GetNode() is the base station, so
-                //   GetNode()->GetObject<MobilityModel>() gives the BS position.
-                //   UAV-to-BS distance drives signal power; jammer-to-BS distance
-                //   drives constant interference.  The old code measured UAV-to-jammer
-                //   distance, which has no direct bearing on what the receiver sees.
-                //
-                // FIX 2 – Physics: drop probability now derives from a proper
-                //   SINR calculation (BPSK BER → PER) rather than a quadratic
-                //   heuristic that was not grounded in any propagation model.
                 Ptr<MobilityModel> bsMob  = GetNode()->GetObject<MobilityModel>();
                 Ptr<MobilityModel> uavMob = m_uavNode->GetObject<MobilityModel>();
                 Ptr<MobilityModel> jamMob = m_jammerNode->GetObject<MobilityModel>();
 
-                double d_uav_bs = uavMob->GetDistanceFrom(bsMob); // signal path
-                double d_jam_bs = jamMob->GetDistanceFrom(bsMob); // interference path (fixed)
+                double d_uav_bs = uavMob->GetDistanceFrom(bsMob); 
+                double d_jam_bs = jamMob->GetDistanceFrom(bsMob); 
 
-                double P_signal = rx_power_watts(P_TX_DBM,  d_uav_bs);
-                double P_interf = rx_power_watts(P_JAM_DBM, d_jam_bs);
+                // --- ENHANCEMENT A: Log-Normal Shadowing Realism ---
+                double shadow_uav = m_shadowingRng->GetValue();
+                double shadow_jam = m_shadowingRng->GetValue();
+
+                double P_signal = rx_power_watts(P_TX_DBM + shadow_uav,  d_uav_bs);
+                double P_interf = rx_power_watts(P_JAM_DBM + shadow_jam, d_jam_bs);
                 double P_noise  = dBm_to_watts(N0_DBM);
 
                 double sinr    = P_signal / (P_noise + P_interf);
@@ -184,24 +179,25 @@ private:
                 double ber     = sinr_to_ber(sinr);
                 double per     = ber_to_per(ber, pSize);
 
-                std::cout << "[ns-3 Channel] d_UAV→BS=" << d_uav_bs
-                          << " m  SINR=" << sinr_dB << " dB"
-                          << "  BER=" << ber << "  PER=" << per << "\n";
-
-                // 1. Packet erasure (whole-packet drop based on PER)
+                // --- ENHANCEMENT B: Smooth PDR via Driver-Level EWMA Filtering ---
+                // Instead of a strict drop/no-drop binary step function, we maintain 
+                // a historical channel state tracking filter, simulating hardware MAC behaviors.
+                double alpha_pdr = 0.15; // Smoothing factor (lower = smoother transitions)
+                
                 if (m_rng->GetValue() < per) {
-                    std::cout << "[ns-3] 💥 JAMMER ERASED PACKET!"
-                              << "  (SINR: " << sinr_dB << " dB | PER: " << per << ")\n";
+                    // Packet Erased
+                    m_smoothedPdr = (1.0 - alpha_pdr) * m_smoothedPdr + alpha_pdr * 0.0;
+                    
+                    std::cout << "[ns-3 Channel] 💥 Packets Dropped. Smoothed PDR trending down: " 
+                              << (m_smoothedPdr * 100.0) << " %\n";
+                              
                     delete[] buffer;
                     forward = false;
                 } else {
-                    // 2. Residual bit-level corruption on surviving packets.
-                    //
-                    // FIX: old code did  buffer[idx] ^= 0xFF  which flips all 8 bits
-                    //      of a single byte simultaneously.  Real AWGN or broadband
-                    //      jamming causes *independent* bit errors scattered across
-                    //      the entire payload.  Each bit is now flipped independently
-                    //      with probability BER.
+                    // Packet Successfully Received
+                    m_smoothedPdr = (1.0 - alpha_pdr) * m_smoothedPdr + alpha_pdr * 1.0;
+
+                    // Execute independent bit corruption for remaining bits
                     uint32_t flipped = 0;
                     for (uint32_t byteIdx = HEADER_LEN; byteIdx < pSize; ++byteIdx) {
                         for (int bit = 0; bit < 8; ++bit) {
@@ -211,19 +207,17 @@ private:
                             }
                         }
                     }
-                    if (flipped > 0)
-                        std::cout << "[ns-3] ⚡ JAMMER CORRUPTED " << flipped
-                                  << " bit(s)!  (SINR: " << sinr_dB << " dB)\n";
-                    else
-                        std::cout << "[ns-3] ✅ Packet survived jammer channel cleanly.\n";
+                    
+                    std::cout << "[ns-3 Channel] ✅ Packet Received. Smoothed PDR: " 
+                              << (m_smoothedPdr * 100.0) << " % | SINR: " << sinr_dB << " dB\n";
                 }
 
             } else {
-                // Scenarios A and C: ideal channel – no jammer
-                std::cout << "[ns-3] ✅ Packet passed cleanly (ideal channel).\n";
+                // Scenarios A and C: Ideal channel
+                m_smoothedPdr = (1.0 - 0.15) * m_smoothedPdr + 0.15 * 1.0;
+                std::cout << "[ns-3] ✅ Clean Frame.\n";
             }
 
-            // Forward to Digital Twin only if packet was not erased
             if (forward) {
                 sendto(m_hostSendTwinFd, buffer, pSize, 0,
                        reinterpret_cast<const sockaddr*>(&m_twinAddr), sizeof(m_twinAddr));
@@ -232,16 +226,17 @@ private:
         }
     }
 
-    int                        m_hostSendTwinFd;
-    uint16_t                   m_twinPort;
-    sockaddr_in                m_twinAddr{};
-    Ptr<Socket>                m_ns3Socket;
-    Ptr<Node>                  m_uavNode;
-    Ptr<Node>                  m_jammerNode;
-    std::string                m_scenario;
-    Ptr<UniformRandomVariable> m_rng;     // FIX: ns-3 controlled RNG
+    int                         m_hostSendTwinFd;
+    uint16_t                    m_twinPort;
+    sockaddr_in                 m_twinAddr{};
+    Ptr<Socket>                 m_ns3Socket;
+    Ptr<Node>                   m_uavNode;
+    Ptr<Node>                   m_jammerNode;
+    std::string                 m_scenario;
+    Ptr<UniformRandomVariable>  m_rng;
+    Ptr<NormalRandomVariable>   m_shadowingRng; // For realistic environmental clutter
+    double                      m_smoothedPdr;   // Continuous trace variable for paper figures
 };
-
 
 int main(int argc, char *argv[]) {
     GlobalValue::Bind("SimulatorImplementationType",

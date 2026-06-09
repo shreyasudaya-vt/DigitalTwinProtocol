@@ -38,6 +38,8 @@ trap cleanup SIGINT
 echo -e "${BLUE}🧹 Executing environment pre-clean to guarantee available ports...${NC}"
 pkill -9 -f "digital_twin.py" 2>/dev/null
 pkill -9 -f "edge_node.py" 2>/dev/null
+fuser -k 9000/udp 2>/dev/null
+fuser -k 5000/udp 2>/dev/null
 sleep 1
 
 # Define your IEEE evaluation scenarios
@@ -55,18 +57,26 @@ do
     # 1. Clear out historical test data for this specific scenario to prevent false positives
     rm -f "telemetry_${SCENARIO}.csv"
 
-    # 2. Start the Digital Twin Server in the background
+    # 2. Start the Digital Twin Server in the background unbuffered (python3 -u)
     echo "🖥️  Spinning up Digital Twin Server..."
-    python3 digital_twin.py "$SCENARIO" &
+    python3 -u digital_twin.py "$SCENARIO" &
     TWIN_PID=$!
     
-    # 3. Start the Edge Node in the background
+    # 3. Start the Edge Node in the background unbuffered (python3 -u)
     echo "📡 Initializing Edge Node telemetry engine..."
-    python3 edge_node.py "$SCENARIO" &
+    python3 -u edge_node.py "$SCENARIO" &
     EDGE_PID=$!
 
     # Give sockets and hardware initialization a brief moment to bind safely
     sleep 2
+    
+    # Verify both background engines survived initialization
+    if ! kill -0 $TWIN_PID 2>/dev/null || ! kill -0 $EDGE_PID 2>/dev/null; then
+        echo -e "${RED}❌ Error: Python telemetry engines crashed immediately during startup!${NC}"
+        echo "   Check your python terminal logs or syntax corrections."
+        kill -9 $TWIN_PID $EDGE_PID 2>/dev/null
+        continue
+    fi
     
     # Copy scratch file over to ns-3 directory dynamically
     cp anasta_sim.cc "$NS3_WORKDIR/scratch/anasta_sim.cc"
@@ -77,24 +87,27 @@ do
     
     # Run the simulation unthrottled with scenario flags passed directly to ns-3
     ./ns3 run scratch/anasta_sim -- --scenario=$SCENARIO
+    NS3_STATUS=$?
 
     # Return to the Python workspace
     cd "$PYTHON_WORKDIR" || exit 1
 
-    # 5. Gracefully terminate background Python threads using their exact PIDs
+    # 5. Gracefully terminate background Python threads
     echo "🛑 Stopping background Python applications..."
-    kill -INT $TWIN_PID 2>/dev/null
-    kill -INT $EDGE_PID 2>/dev/null
-    sleep 2
     
-    # Precise isolation: Hard-kill ONLY the exact PIDs assigned to this iteration loop
+    # Send SIGINT first to allow python engines to gracefully flush __del__ and file writing handlers
+    kill -SIGINT $TWIN_PID 2>/dev/null
+    kill -SIGINT $EDGE_PID 2>/dev/null
+    sleep 3
+    
+    # Precise isolation: Hard-kill ONLY if they refused to stop gracefully after 3 seconds
     kill -9 $TWIN_PID 2>/dev/null
     kill -9 $EDGE_PID 2>/dev/null
 
     # 6. Data Processing, Verification, and Plot Generation
     EXPECTED_CSV="telemetry_${SCENARIO}.csv"
     
-    if [ -f "$EXPECTED_CSV" ]; then
+    if [ -f "$EXPECTED_CSV" ] && [ -s "$EXPECTED_CSV" ]; then
         echo -e "${GREEN}📊 Telemetry data verified for $SCENARIO -> ($EXPECTED_CSV)${NC}"
         echo "📈 Rendering publication plots..."
         
@@ -103,8 +116,8 @@ do
         
         echo -e "${GREEN}💾 Raw telemetry log and PDF assets successfully saved.${NC}"
     else
-        echo -e "${RED}⚠️  Error: Expected output file '$EXPECTED_CSV' was not detected!${NC}"
-        echo "   Please check if digital_twin.py threw an unhandled runtime exception."
+        echo -e "${RED}⚠️  Error: Expected output file '$EXPECTED_CSV' is missing or completely EMPTY!${NC}"
+        echo "   This implies the python nodes were killed before flushing telemetry to disk."
     fi
     
     echo -e "${BLUE}Done with $SCENARIO. Transitioning to next test cycle...${NC}"
@@ -114,7 +127,7 @@ done
 # Restore default shell job settings
 set -m
 
-echo -e "${GREEN}==========================================================${NC}"
+echo -e "${BLUE}==========================================================${NC}"
 echo -e "${YELLOW}🎉 All Core Scenarios Executed and Plotted Successfully!${NC}"
 echo -e "${GREEN}📂 High-quality evaluation assets generated inside workspace.${NC}"
-echo -e "${GREEN}==========================================================${NC}"
+echo -e "${BLUE}==========================================================${NC}"

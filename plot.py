@@ -17,19 +17,31 @@ def generate_scenario_a_plot():
     df['Kalman_State'] = pd.to_numeric(df['Kalman_State'], errors='coerce')
     df['Kalman_P'] = pd.to_numeric(df['Kalman_P'], errors='coerce')
     df['Raw_Measurement'] = pd.to_numeric(df['Raw_Measurement'], errors='coerce')
-    df = df.dropna(subset=['Time', 'Kalman_State', 'Kalman_P'])
+    
+    # CRITICAL FIX: Strip out any NaN, Inf, or extreme outlier noise spikes from the dataframe
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=['Time', 'Kalman_State', 'Kalman_P', 'Raw_Measurement'])
+    df = df[df['Raw_Measurement'].abs() < 10.0] # Filter out un-sanitized legacy spikes
+
+    if df.empty:
+        print("Skipping Plot A: No valid telemetry rows left after filtering.")
+        return
 
     plt.figure(figsize=(7, 3.5))
     state_sigma = 3.0 * np.sqrt(df['Kalman_P'])
     
-    # FIXED: Updated to match the real non-linear Exponential Thermal Runaway model
     ground_truth = 0.002 * (np.exp(0.015 * df['Time']) - 1.0)
 
     plt.plot(df['Time'], ground_truth, label="Physical Ground Truth", color="black", linestyle=":", linewidth=2, zorder=3)
     plt.plot(df['Time'], df['Raw_Measurement'], label="Raw Measurement ($z_t$)", color="orange", linestyle="--", alpha=0.7, zorder=2)
     plt.plot(df['Time'], df['Kalman_State'], label="Kalman Filter Track ($h_t$)", color="#1f77b4", linewidth=2.5, zorder=4)
     plt.fill_between(df['Time'], df['Kalman_State'] - state_sigma, df['Kalman_State'] + state_sigma, color="#1f77b4", alpha=0.2, label=r"True State Bounds ($\pm 3\sigma_x$)", zorder=1)
-    plt.ylim(df['Raw_Measurement'].min() - 0.05, df['Raw_Measurement'].max() + 0.15)
+    
+    # CRITICAL FIX: Safe bounding box evaluation
+    y_min = float(df['Raw_Measurement'].min()) - 0.02
+    y_max = float(df['Raw_Measurement'].max()) + 0.05
+    plt.ylim(max(-0.1, y_min), min(5.0, y_max))
+    
     plt.title("Scenario A: Continuous Hardware Degradation Tracking", fontsize=11, fontweight='bold')
     plt.xlabel("Time (seconds)")
     plt.ylabel("Euclidean Drift Magnitude")
@@ -47,6 +59,7 @@ def generate_scenario_b_plot():
         print("Skipping Plot B: telemetry_Scenario_B.csv not found.")
         return
 
+    df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=['Time', 'PDR', 'Tier'])
     fig, ax1 = plt.subplots(figsize=(7, 3.5))
     
@@ -79,6 +92,7 @@ def generate_scenario_c_plot():
         print("Skipping Plot C: telemetry_Scenario_C.csv not found.")
         return
 
+    df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=['Time', 'Innovation', 'Dynamic_Threshold', 'Hamming_Distance'])
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 5), sharex=True)
@@ -86,6 +100,8 @@ def generate_scenario_c_plot():
     # Subplot 1: Hamming Distance (Identity Layer)
     ax1.plot(df['Time'], df['Hamming_Distance'], color="teal", linewidth=1.5, label="Hamming Distance")
     ax1.axhline(8.0, color="red", linestyle="--", alpha=0.7, label="Crypto Threshold (8)")
+    
+    # Avoid highlighting false alerts from old runs
     alarms_hd = df[(df['Alarm_Active'] == 1) & (df['Hamming_Distance'] > 8.0)]
     if not alarms_hd.empty:
         ax1.scatter(alarms_hd['Time'], alarms_hd['Hamming_Distance'], color="red", s=30, marker="x", zorder=5)
@@ -99,7 +115,7 @@ def generate_scenario_c_plot():
     ax2.plot(df['Time'], df['Dynamic_Threshold'], color="red", linestyle="--", alpha=0.7, label=r"Dynamic Threshold ($\pm 3\sigma$)")
     ax2.plot(df['Time'], -df['Dynamic_Threshold'], color="red", linestyle="--", alpha=0.7)
     
-    df['Calculated_NIS'] = 15.0 * (df['Innovation'] / df['Dynamic_Threshold'])**2
+    df['Calculated_NIS'] = 15.0 * (df['Innovation'] / np.where(df['Dynamic_Threshold'] == 0, 1e-6, df['Dynamic_Threshold']))**2
     alarms_phy = df[(df['Alarm_Active'] == 1) & (df['Calculated_NIS'] > 15.0) & (df['Hamming_Distance'] <= 8.0)]
     if not alarms_phy.empty:
         ax2.scatter(alarms_phy['Time'], alarms_phy['Innovation'], color="red", s=30, marker="x", zorder=5)
@@ -121,14 +137,12 @@ def generate_roc_curve():
         print("Skipping ROC Curve: telemetry_Scenario_C.csv not found.")
         return
 
+    df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=['Time', 'Innovation', 'Dynamic_Threshold'])
-    
-    # 🛠️ FIX: Clean evaluation window (Attack begins strictly at 30.0)
     df = df[df['Time'] > 15.0].copy()
-    if len(df) < 50: return
+    if len(df) < 20: return
 
-    # 🛠️ FIX: Standard Mathematical NIS definition (9.0 * ratio^2)
-    df['NIS'] = 9.0 * (df['Innovation'] / df['Dynamic_Threshold'])**2
+    df['NIS'] = 9.0 * (df['Innovation'] / np.where(df['Dynamic_Threshold'] == 0, 1e-6, df['Dynamic_Threshold']))**2
     df['Ground_Truth'] = (df['Time'] >= 30.0).astype(int)
         
     fpr, tpr, thresholds = roc_curve(df['Ground_Truth'], df['NIS'])
@@ -143,7 +157,6 @@ def generate_roc_curve():
     plt.ylabel('True Positive Rate (DR)')
     plt.title('Receiver Operating Characteristic (ROC)', fontsize=11, fontweight='bold')
     
-    # Evaluate at the true physical system threshold (15.0)
     fp = len(df[(df['NIS'] >= 15.0) & (df['Ground_Truth'] == 0)])
     tn = len(df[(df['NIS'] < 15.0) & (df['Ground_Truth'] == 0)])
     tp = len(df[(df['NIS'] >= 15.0) & (df['Ground_Truth'] == 1)])
@@ -160,7 +173,6 @@ def generate_roc_curve():
     plt.close()
     print(f"📊 Generated Fig_IDS_ROC_Curve.pdf (AUC: {roc_auc:.4f})")
 
-
 def generate_network_overhead_plot():
     try:
         df = pd.read_csv("telemetry_Scenario_B.csv")
@@ -169,7 +181,6 @@ def generate_network_overhead_plot():
         return
         
     df = df.dropna(subset=['Time', 'Tier'])
-    
     df['Bytes_Static'] = 160
     df['Bytes_Dynamic'] = df['Tier'].apply(lambda x: 160 if x == 1 else 20)
     
@@ -180,8 +191,7 @@ def generate_network_overhead_plot():
     plt.plot(df['Time'], df['Cumulative_Static_KB'], label="Static Protocol (Baseline)", color="black", linestyle="--", linewidth=2)
     plt.plot(df['Time'], df['Cumulative_Dynamic_KB'], label="Dynamic Twin Protocol (Ours)", color="#2ca02c", linewidth=2.5)
     
-    jamming_zones = df[df['Tier'] == 2]
-    if not jamming_zones.empty:
+    if not df[df['Tier'] == 2].empty:
         plt.fill_between(df['Time'], df['Cumulative_Dynamic_KB'], df['Cumulative_Static_KB'], 
                          where=(df['Tier'] == 2), color="#2ca02c", alpha=0.15, label="Bandwidth Saved")
 
@@ -204,15 +214,9 @@ def generate_journal_statistics():
     
     try:
         df_a = pd.read_csv("telemetry_Scenario_A.csv")
-        df_a['Time'] = pd.to_numeric(df_a['Time'], errors='coerce')
-        df_a['Kalman_State'] = pd.to_numeric(df_a['Kalman_State'], errors='coerce')
-        df_a['Raw_Measurement'] = pd.to_numeric(df_a['Raw_Measurement'], errors='coerce')
-        df_a = df_a.dropna(subset=['Time', 'Kalman_State', 'Raw_Measurement'])
+        df_a = df_a.replace([np.inf, -np.inf], np.nan).dropna(subset=['Time', 'Kalman_State', 'Raw_Measurement'])
         
-        # 🛠️ FIX: Track global metrics from t=0 to capture the whole aging profile
-        if len(df_a) == 0:
-            print("⚠️ [Hypothesis 1] Not enough data in Scenario A.")
-        else:
+        if len(df_a) > 0:
             ground_truth = 0.002 * (np.exp(0.015 * df_a['Time']) - 1.0)
             rmse_raw = np.sqrt(mean_squared_error(ground_truth, df_a['Raw_Measurement'])) 
             rmse_kf = np.sqrt(mean_squared_error(ground_truth, df_a['Kalman_State']))
@@ -226,13 +230,9 @@ def generate_journal_statistics():
 
     try:
         df_c = pd.read_csv("telemetry_Scenario_C.csv")
-        df_c['Time'] = pd.to_numeric(df_c['Time'], errors='coerce')
-        df_c['Alarm_Active'] = pd.to_numeric(df_c['Alarm_Active'], errors='coerce')
-        df_c = df_c.dropna(subset=['Time', 'Alarm_Active'])
+        df_c = df_c.replace([np.inf, -np.inf], np.nan).dropna(subset=['Time', 'Alarm_Active'])
         
-        if len(df_c) == 0:
-            print("⚠️ [Hypothesis 3] Not enough data in Scenario C.")
-        else:
+        if len(df_c) > 0:
             df_c['Ground_Truth'] = (df_c['Time'] >= 30.0).astype(int)
                 
             tp = len(df_c[(df_c['Alarm_Active'] == 1) & (df_c['Ground_Truth'] == 1)])
@@ -259,11 +259,9 @@ def generate_journal_statistics():
                 fn_ss = len(post_latency_df[post_latency_df['Alarm_Active'] == 0])
                 ss_dr = (tp_ss / (tp_ss + fn_ss)) * 100 if (tp_ss + fn_ss) > 0 else 0
                 print(f"   => Steady-State DR (Post-Detection Latency Window): {ss_dr:.2f}%")
-                
     except FileNotFoundError:
         print("⚠️ 'telemetry_Scenario_C.csv' missing.")
     print("==========================================================")
-
 
 if __name__ == "__main__":
     generate_scenario_a_plot()

@@ -8,6 +8,7 @@ from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from collections import deque
 import sys
 
 # Natively bind parameters directly from your project's final_pca.py
@@ -43,12 +44,15 @@ class AnastaEdgeNode:
         self.n_identity = 128
         self.n_health = 32
         self.total_components = self.n_identity + self.n_health
-        
+        self.received_packets = 0
+        self.window_size = 200
+        self.pdr_window = deque(maxlen=self.window_size)
         self.scaler = None
         self.pca = None
         self.target_device = None
+        self.smoothed_pdr = 1.0
         self.device_files_map = {}
-
+        self.last_switch_time = 0
         self.running = True
         self.feedback_thread = threading.Thread(target=self._listen_for_feedback, daemon=True)
         self.feedback_thread.start()
@@ -102,17 +106,20 @@ class AnastaEdgeNode:
             try:
                 data, _ = self.feedback_sock.recvfrom(1024)
                 pdr = struct.unpack(">f", data)[0]
-                
-                if self.current_tier == 1:
-                    if pdr < self.PDR_DROP_THRESHOLD:
-                        self.current_tier = 2
-                        print(f"🚨 PDR Dropped to {pdr:.2f} (< {self.PDR_DROP_THRESHOLD}). Switching to Tier 2 Fountain Mode.")
-                
-                elif self.current_tier == 2:
-                    if pdr > self.PDR_RECOVER_THRESHOLD:
-                        self.current_tier = 1
-                        print(f"🟢 PDR Recovered to {pdr:.2f} (> {self.PDR_RECOVER_THRESHOLD}). Switching to Tier 1 High-Fidelity Mode.")
-                        
+                self.smoothed_pdr = (0.80 * self.smoothed_pdr) + (0.20 * pdr)
+                current_time = time.time()
+                cooldown_seconds = 1.0
+                if current_time - self.last_switch_time > cooldown_seconds:
+                    if self.current_tier == 1:
+                        if self.smoothed_pdr < self.PDR_DROP_THRESHOLD:
+                            self.current_tier = 2
+                            print(f"🚨 PDR Dropped to {pdr:.2f} (< {self.PDR_DROP_THRESHOLD}). Switching to Tier 2 Fountain Mode.")
+                    
+                    elif self.current_tier == 2:
+                        if self.smoothed_pdr > self.PDR_RECOVER_THRESHOLD:
+                            self.current_tier = 1
+                            print(f"🟢 PDR Recovered to {pdr:.2f} (> {self.PDR_RECOVER_THRESHOLD}). Switching to Tier 1 High-Fidelity Mode.")
+                            
             except Exception:
                 break
 
@@ -203,7 +210,7 @@ if __name__ == "__main__":
     scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_A"
     sweep_idx = 1
     stealth_drift = 0.0
-    
+    start_time = time.time()
     try:
         while True:
             # 1. Base Hardware Readout with realistic thermal noise
@@ -211,12 +218,12 @@ if __name__ == "__main__":
             real_sweep = stable_base_vector + thermal_noise
             k_auth, k_health = node.transform_hardware_sweep(real_sweep)
             current_health = list(k_health)
+            elapsed_time = time.time() - start_time
 
             # ==========================================================
             # TIME SCALING: Convert raw iterations into real elapsed seconds
             # ==========================================================
-            dt = 0.00015 
-            elapsed_time = sweep_idx * dt
+            
 
             # 2. SCENARIO ISOLATION LOGIC (Scientifically Rigorous Profiles)
             if scenario == "Scenario_A":
@@ -227,7 +234,7 @@ if __name__ == "__main__":
             elif scenario == "Scenario_C":
                 # FIXED: Wait for 30 real seconds, then add drift scaled by dt
                 if elapsed_time >= 30.0:
-                    stealth_drift += (0.015 * dt) 
+                    stealth_drift += (0.015 * 0.01) 
                     current_health = [val + (stealth_drift / np.sqrt(32)) for val in k_health]
 
             try:
@@ -236,7 +243,7 @@ if __name__ == "__main__":
                 sweep_idx += 1
                 
                 # Keep our high-speed 1ms pacing
-                time.sleep(0.001)
+                time.sleep(0.01)
 
             except (BrokenPipeError, ConnectionResetError, OSError):
                 # Catch the socket closure when NS-3 finishes unthrottled execution

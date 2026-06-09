@@ -17,14 +17,14 @@ class DigitalTwinServer:
         
         self.feedback_address = (feedback_ip, feedback_port)
         self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        
+        self.blackout_recovery = False
         self.master_key = master_key
         self.salt = salt
         self.received_packets = 0
-        self.window_size = 40
+        self.window_size = 200
         self.pdr_window = deque(maxlen=self.window_size)
         self.last_seq = -1
-        self.is_locked_out=False
+        self.is_locked_out = False
 
         self.consecutive_anomalies = 0
         self.is_enrolled = False
@@ -35,17 +35,22 @@ class DigitalTwinServer:
         self.bp_graph = []       
         self.resolved_bits = {}
         
+        # --- Kalman Filter Setup ---
         self.kf = KalmanFilter(dim_x=2, dim_z=1)
         self.kf.x = np.array([[0.0], [0.0]])
-        dt = 0.00015
+        dt = 0.01
         self.kf.F = np.array([[1.0, dt], [0.0, 1.0]])
         self.kf.H = np.array([[1.0, 0.0]])
         
-        self.kf.P = np.array([[0.01, 0.0], [0.0, 1e-4]])
-        self.kf.R = np.array([[0.002]]) 
-        self.kf.Q = np.diag([1e-2, 1e-2])
+        self.kf.P = np.array([[1.0, 0.0], [0.0, 1.0]])
+        self.kf.R = np.array([[0.0005**2]]) 
+        
+        # Optimized Q Matrix: Locks in a slow, steady degradation slope
+        self.kf.Q = np.array([
+            [1e-4, 0.0], 
+            [0.0, 1e-9]
+        ])
     
- 
         self.warmup_count = 0
         self.WARMUP_PACKETS = 25
         self.start_time = time.time()
@@ -109,8 +114,10 @@ class DigitalTwinServer:
             return
             
         payload = data[14:]
-
+        self.warmup_count += 1
         self.received_packets += 1
+        
+        # Calculate PDR
         if self.last_seq == -1:
             self.pdr_window.append(1)
         else:
@@ -120,11 +127,25 @@ class DigitalTwinServer:
                 for _ in range(missed): self.pdr_window.append(0)
                 self.pdr_window.append(1)
         self.last_seq = max(self.last_seq, seq)
-
+        
         pdr = sum(self.pdr_window) / max(1, len(self.pdr_window))
         self.tx_sock.sendto(struct.pack(">f", pdr), self.feedback_address)
 
-        R_base = 0.002 
+        # --- FIXED dt CALCULATION: Track true simulation time ---
+        if hasattr(self, 'last_telemetry_time'):
+            dt = telemetry - self.last_telemetry_time
+            # Guard against out-of-order packets causing negative time
+            if dt <= 0: 
+                dt = 0.01
+        else:
+            dt = 0.01
+        if dt > 5.0:
+            self.blackout_recovery = True
+            dt = 0.01
+        self.last_telemetry_time = telemetry
+
+        self.last_packet_timestamp = timestamp
+        R_base = 0.0005**2
         alpha_noise = 5.0
         self.kf.R = np.array([[R_base + alpha_noise * (1.0 - pdr)]])
 
@@ -137,13 +158,22 @@ class DigitalTwinServer:
             p_auth = payload[:16]
             p_health_bytes = payload[16:144]
 
-            k_auth_rec = bytes(a ^ b for a, b in zip(p_auth, n_i))
-            rec_bits = np.unpackbits(np.frombuffer(k_auth_rec, dtype=np.uint8))
-
+            # 1. Safe Float Deserialization & Sanity Check
             if len(p_health_bytes) == 128:
-                k_health_rec = np.array(struct.unpack(">32f", p_health_bytes))
+                try:
+                    k_health_rec = np.array(struct.unpack(">32f", p_health_bytes))
+                    
+                    # Prevent mangled channel floats from poisoning the tracker
+                    if np.any(np.isnan(k_health_rec)) or np.any(np.isinf(k_health_rec)) or np.any(np.abs(k_health_rec) > 100.0):
+                        raise ValueError("Mangled floats detected due to RF channel noise.")
+                except (struct.error, ValueError):
+                    # Coast gracefully using prior state if frame is corrupted
+                    k_health_rec = self.baseline_k_health if self.baseline_k_health is not None else np.zeros(32)
             else:
                 k_health_rec = self.baseline_k_health if self.baseline_k_health is not None else np.zeros(32)
+
+            k_auth_rec = bytes(a ^ b for a, b in zip(p_auth, n_i))
+            rec_bits = np.unpackbits(np.frombuffer(k_auth_rec, dtype=np.uint8))
 
             if not self.is_enrolled:
                 self.baseline_k_auth_bits = np.copy(rec_bits)
@@ -153,53 +183,66 @@ class DigitalTwinServer:
 
             hd = int(np.sum(rec_bits != self.baseline_k_auth_bits))
             health_drift = float(np.linalg.norm(k_health_rec - self.baseline_k_health))
-
+            
+            self.kf.F[0, 1] = dt
             self.kf.predict()
+            
             innovation = float(health_drift - self.kf.x[0, 0])
             S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
-            nis = (innovation ** 2) / S_pre
-            threshold = float(3.0 * np.sqrt(S_pre))
+            
+            # Dynamic Sigma for FAR/TDR optimization
+            sigma_multiplier = 3.0 if pdr >= 0.90 else 4.5
+            threshold = float(sigma_multiplier * np.sqrt(S_pre))
             alarm_triggered = 0
-            if telemetry < 25.0:
+            
+            if telemetry < 25.0 or self.warmup_count < self.WARMUP_PACKETS:
                 self.kf.update(np.array([[health_drift]]))
                 self.consecutive_anomalies = 0
                 alarm_triggered = 0
                 self.is_locked_out = False
-            
-            # --- 2. Active Monitoring Period ---
             else:
-                # If a persistent attack was already confirmed, hold the line
                 if self.is_locked_out:
                     alarm_triggered = 1
-                    # Coast safely without ingestion
                 
-                elif hd > 8:
-                    print(f"   🚨 ALARM: Identity Spoofing Detected! (Hamming Distance: {hd})")
+                # Flag Identity Spoofing only if channel quality is solid
+                elif hd > 8 and pdr > 0.85:
+                    print(f"   🚨 ALARM: Confirmed Identity Spoofing! (HD: {hd} | PDR: {pdr:.2f})")
                     alarm_triggered = 1
-                    # Coast mode to protect the matrix
-                    
-                # 🌟 FIX: Use the true dynamic 3-sigma threshold instead of a rigid NIS constant
-                elif abs(innovation) > threshold:
-                    self.consecutive_anomalies += 1
-                    print(f"   ⚠️ Transient Anomaly Alert (Innov: {abs(innovation):.4f} > {threshold:.4f}) | Counter: {self.consecutive_anomalies}/5")
-                    
-                    if self.consecutive_anomalies > 5:
-                        print(f"   🚨 ALARM: Persistent Physical Health Anomaly Confirmed!")
-                        self.is_locked_out = True
-                        alarm_triggered = 1
-                    else:
-                        alarm_triggered = 0  # Defensive coasting
-                        
-                else:
-                    # --- 3. Clean & Healthy State ---
+                elif self.blackout_recovery:
+                    # Waking up from a massive blackout. 
+                    self.kf.x = np.array([[health_drift], [0.0006]])
+                    self.kf.P = np.array([[1e-4, 0.0], [0.0, 1e-4]])
                     self.consecutive_anomalies = 0
+                    alarm_triggered = 0
+                    self.blackout_recovery = False
+                    
+                elif abs(innovation) > threshold:
+                    # Transient dropouts shouldn't trigger hardware exploit alarms
+                    if pdr < 0.80:
+                        # Coast defensively without raising an alarm or updating filter
+                        alarm_triggered = 0
+                    else:
+                        self.consecutive_anomalies += 2
+                        print(f"   ⚠️ Physical Deviation Detected (Innov: {abs(innovation):.4f}) | Counter: {self.consecutive_anomalies}/8")
+                        
+                        # Requires persistent deviation to lower FAR
+                        if self.consecutive_anomalies >= 8:
+                            print(f"   🚨 ALARM: Persistent Physical Health Anomaly Confirmed!")
+                            self.is_locked_out = True
+                            alarm_triggered = 1
+                        else:
+                            alarm_triggered = 0  
+                else:
+                    # Clean & Healthy State
+                    self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
                     self.kf.update(np.array([[health_drift]]))
                     alarm_triggered = 0
+
             self.csv_writer.writerow([
                 telemetry, seq, tier_id, pdr, hd,
                 health_drift, float(self.kf.x[0, 0]), float(self.kf.P[0, 0]),
                 innovation, threshold, alarm_triggered,
-            ])
+                ])
             self.log_file.flush()
 
         elif tier_id == 2:
@@ -232,7 +275,6 @@ class DigitalTwinServer:
                 degree_1_nodes = [n for n in self.bp_graph if len(n['indices']) == 1]
                 
                 for node in degree_1_nodes:
-                    # FIXED: Check if a previous node's avalanche already emptied this node
                     if len(node['indices']) != 1:
                         continue
                         
@@ -240,22 +282,21 @@ class DigitalTwinServer:
                     if idx not in self.resolved_bits:
                         val = node['value']
                         self.resolved_bits[idx] = val
-                        progress=True
+                        progress = True
                         for other_node in self.bp_graph:
                             if idx in other_node['indices']:
                                 other_node['indices'].remove(idx)
                                 other_node['value'] ^= val
                                 
-                                
                 self.bp_graph = [n for n in self.bp_graph if len(n['indices']) > 0]
 
+            self.kf.F[0, 1] = dt
             self.kf.predict()
             estimated_health = float(self.kf.x[0, 0])
             threshold = float(5.0 * np.sqrt(float(self.kf.P[0, 0])))
 
             unobserved = 128 - len(self.resolved_bits)
             if unobserved > 0:
-                # FIXED: Use telemetry time
                 self.csv_writer.writerow([
                     telemetry, seq, tier_id, pdr, -1, 
                     np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, 0
@@ -276,7 +317,6 @@ class DigitalTwinServer:
             hd = int(np.sum(final_bits != self.baseline_k_auth_bits))
             alarm_triggered = 1 if (self.warmup_count >= self.WARMUP_PACKETS and hd > 8) else 0
 
-            # FIXED: Use telemetry time
             self.csv_writer.writerow([
                 telemetry, seq, tier_id, pdr, hd,
                 np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, alarm_triggered,
