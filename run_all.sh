@@ -43,7 +43,9 @@ fuser -k 5000/udp 2>/dev/null
 sleep 1
 
 # Define your IEEE evaluation scenarios
-SCENARIOS=("Scenario_A" "Scenario_B" "Scenario_C")
+SCENARIOS=("Scenario_A" "Scenario_B" "Scenario_C" "Scenario_D")
+
+
 
 for SCENARIO in "${SCENARIOS[@]}"
 do
@@ -109,7 +111,7 @@ do
     
     if [ -f "$EXPECTED_CSV" ] && [ -s "$EXPECTED_CSV" ]; then
         echo -e "${GREEN}📊 Telemetry data verified for $SCENARIO -> ($EXPECTED_CSV)${NC}"
-        echo "📈 Rendering publication plots..."
+        
         
         # Pass the scenario name to your plotting script to preserve individual outputs
         python3 plot.py "$SCENARIO"

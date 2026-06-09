@@ -58,10 +58,12 @@ class DigitalTwinServer:
         self.log_filename = f"telemetry_{scenario_name}.csv"
         self.log_file = open(self.log_filename, "w", newline="")
         self.csv_writer = csv.writer(self.log_file)
+        
         self.csv_writer.writerow([
             "Time", "Seq", "Tier", "PDR", "Hamming_Distance",
             "Raw_Measurement", "Kalman_State", "Kalman_P", "Innovation",
             "Dynamic_Threshold", "Alarm_Active",
+            "Sensor_Vel", "Sensor_Accel", "Expected_Accel", "Spatial_Residual", "Spatial_Alarm"
         ])
         self.log_file.flush()
 
@@ -105,15 +107,15 @@ class DigitalTwinServer:
         return graph
 
     def process_packet(self, data):
-        if len(data) < 14: return
+        if len(data) < 21: return
 
-        timestamp, seq, tier_id, telemetry, reserved = struct.unpack(">IIBfB", data[:14])
+        timestamp, seq, tier_id, telemetry, sens_vel, sens_accel = struct.unpack(">IIBfff", data[:21])
         
         if self.last_seq != -1 and seq <= self.last_seq:
             print(f"   🚨 ALARM: Replay Attack Detected! (Seq {seq} <= {self.last_seq})")
             return
             
-        payload = data[14:]
+        payload = data[21:]
         self.warmup_count += 1
         self.received_packets += 1
         
@@ -132,8 +134,9 @@ class DigitalTwinServer:
         self.tx_sock.sendto(struct.pack(">f", pdr), self.feedback_address)
 
         # --- FIXED dt CALCULATION: Track true simulation time ---
-        if hasattr(self, 'last_telemetry_time'):
-            dt = telemetry - self.last_telemetry_time
+        prev_telemetry_time = getattr(self, 'last_telemetry_time', None)
+        if prev_telemetry_time is not None:
+            dt = telemetry - prev_telemetry_time
             # Guard against out-of-order packets causing negative time
             if dt <= 0: 
                 dt = 0.01
@@ -150,6 +153,23 @@ class DigitalTwinServer:
         self.kf.R = np.array([[R_base + alpha_noise * (1.0 - pdr)]])
 
         n_i, s_i = self._generate_crypto_masks(seq)
+        spatial_alarm = 0
+        spatial_residual = 0.0
+        expected_accel = 0.0
+
+        
+        if hasattr(self, 'last_vel') and prev_telemetry_time is not None:
+            dt_spatial = telemetry - prev_telemetry_time
+            if dt_spatial > 0.001:
+                # Physics Law: a = dv/dt
+                expected_accel = (sens_vel - self.last_vel) / dt_spatial
+                spatial_residual = abs(expected_accel - sens_accel)
+                
+                if spatial_residual > 3.0: # Transducer consistency threshold
+                    spatial_alarm = 1
+                    print(f"   🚨 PHASE 3 ALARM: Transducer Hijacking! Expected Accel: {expected_accel:.2f}, Reported: {sens_accel:.2f}")
+
+        self.last_vel = sens_vel
 
         if tier_id == 1:
             self.bp_graph = []
@@ -242,6 +262,7 @@ class DigitalTwinServer:
                 telemetry, seq, tier_id, pdr, hd,
                 health_drift, float(self.kf.x[0, 0]), float(self.kf.P[0, 0]),
                 innovation, threshold, alarm_triggered,
+                sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm 
                 ])
             self.log_file.flush()
 
@@ -299,7 +320,8 @@ class DigitalTwinServer:
             if unobserved > 0:
                 self.csv_writer.writerow([
                     telemetry, seq, tier_id, pdr, -1, 
-                    np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, 0
+                    np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, 0,
+                    sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm # <-- ADDED
                 ])
                 self.log_file.flush()
                 return
@@ -320,6 +342,7 @@ class DigitalTwinServer:
             self.csv_writer.writerow([
                 telemetry, seq, tier_id, pdr, hd,
                 np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, alarm_triggered,
+                sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm # <-- ADDED
             ])
             self.log_file.flush()
             

@@ -166,9 +166,9 @@ class AnastaEdgeNode:
         k_health = w_low.tolist()
         return k_auth, k_health
 
-    def transmit(self, k_auth, k_health, telemetry_val=22.4):
+    def transmit(self, k_auth, k_health, telemetry_val1=0.0, telemetry_val2=0.0, telemetry_val3=0.0):
             n_i, s_i = self._generate_crypto_masks(self.sequence_counter)
-            header = struct.pack(">IIBfB", int(time.time()) & 0xFFFFFFFF, self.sequence_counter, self.current_tier, telemetry_val, 0)
+            header = struct.pack(">IIBfff", int(time.time()), self.sequence_counter, self.current_tier, float(telemetry_val1), float(telemetry_val2), float(telemetry_val3))
             
             if self.current_tier == 1:
                 # 1. SATURATION GUARD: Clip state values to standard 32-bit float limits
@@ -237,9 +237,35 @@ if __name__ == "__main__":
                     stealth_drift += (0.015 * 0.01) 
                     current_health = [val + (stealth_drift / np.sqrt(32)) for val in k_health]
 
+            elif scenario == "Scenario_D":
+                # FIXED: Add a small random walk component every 10 seconds
+                true_accel = 5.0 * np.sin(0.2 * elapsed_time)
+                
+                if not hasattr(node, 'true_vel'): 
+                    node.true_vel = 0.0
+                node.true_vel += true_accel * 0.01 # Integrate acceleration to get velocity
+                
+                # 2. Add standard transducer noise
+                sensor_vel = node.true_vel + np.random.normal(0, 0.1) # GPS 
+                sensor_accel = true_accel + np.random.normal(0, 0.5)  # IMU
+                
+                # 3. TRANSDUCER HIJACKING ATTACK: At t=150s, attacker manipulates the IMU
+                if elapsed_time >= 150.0:
+                    sensor_accel += 15.0 # Fake massive acceleration spike
+                
+                current_health = [val for val in k_health] # Keep health baseline flat
+
+            
+                # Transmit the expanded telemetry payload
+                
             try:
                 # Your existing transmission line (Line 218)
-                node.transmit(k_auth, current_health, telemetry_val=float(elapsed_time))
+                if scenario == "Scenario_D":
+                    node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=sensor_vel, telemetry_val3=sensor_accel)
+                else:
+                    # Legacy support for Scenarios A, B, C
+                    node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=0.0, telemetry_val3=0.0)
+                
                 sweep_idx += 1
                 
                 # Keep our high-speed 1ms pacing
