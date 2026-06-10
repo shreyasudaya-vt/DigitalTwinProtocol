@@ -161,13 +161,22 @@ class DigitalTwinServer:
         if hasattr(self, 'last_vel') and prev_telemetry_time is not None:
             dt_spatial = telemetry - prev_telemetry_time
             if dt_spatial > 0.001:
-                # Physics Law: a = dv/dt
-                expected_accel = (sens_vel - self.last_vel) / dt_spatial
+                raw_expected_accel = (sens_vel - self.last_vel) / dt_spatial
+
+                # EWMA: smooths residual noise without lagging the hijack step response
+                alpha = 0.5
+                self._smooth_exp_accel = alpha * raw_expected_accel + (1 - alpha) * getattr(
+                    self, '_smooth_exp_accel', raw_expected_accel
+                )
+                expected_accel = self._smooth_exp_accel
+
                 spatial_residual = abs(expected_accel - sens_accel)
-                
-                if spatial_residual > 3.0: # Transducer consistency threshold
+
+                # Warmup guard: mirror the Kalman warmup to suppress startup transients
+                if spatial_residual > 3.0 and telemetry > 25.0:
                     spatial_alarm = 1
-                    print(f"   🚨 PHASE 3 ALARM: Transducer Hijacking! Expected Accel: {expected_accel:.2f}, Reported: {sens_accel:.2f}")
+                    print(f"   🚨 PHASE 3 ALARM: Transducer Hijacking! "
+                        f"Expected: {expected_accel:.2f}, Reported: {sens_accel:.2f}")
 
         self.last_vel = sens_vel
 

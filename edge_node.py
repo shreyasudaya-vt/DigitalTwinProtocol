@@ -246,7 +246,7 @@ if __name__ == "__main__":
                 node.true_vel += true_accel * 0.01 # Integrate acceleration to get velocity
                 
                 # 2. Add standard transducer noise
-                sensor_vel = node.true_vel + np.random.normal(0, 0.1) # GPS 
+                sensor_vel = node.true_vel + np.random.normal(0, 0.005) # GPS 
                 sensor_accel = true_accel + np.random.normal(0, 0.5)  # IMU
                 
                 # 3. TRANSDUCER HIJACKING ATTACK: At t=150s, attacker manipulates the IMU
@@ -262,6 +262,7 @@ if __name__ == "__main__":
                 # Your existing transmission line (Line 218)
                 if scenario == "Scenario_D":
                     node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=sensor_vel, telemetry_val3=sensor_accel)
+                
                 else:
                     # Legacy support for Scenarios A, B, C
                     node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=0.0, telemetry_val3=0.0)
