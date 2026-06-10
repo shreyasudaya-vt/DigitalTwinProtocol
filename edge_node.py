@@ -243,7 +243,12 @@ if __name__ == "__main__":
                 
                 if not hasattr(node, 'true_vel'): 
                     node.true_vel = 0.0
-                node.true_vel += true_accel * 0.01 # Integrate acceleration to get velocity
+                if not hasattr(node, 'last_scenario_d_time'):
+                    node.last_scenario_d_time = elapsed_time
+                dt_actual = elapsed_time - node.last_scenario_d_time
+                node.last_scenario_d_time = elapsed_time
+                node.true_vel += true_accel * dt_actual
+                # Integrate acceleration to get velocity
                 
                 # 2. Add standard transducer noise
                 sensor_vel = node.true_vel + np.random.normal(0, 0.005) # GPS 

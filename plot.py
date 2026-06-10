@@ -145,6 +145,7 @@ def generate_roc_curve():
     df['NIS'] = 9.0 * (df['Innovation'] / np.where(df['Dynamic_Threshold'] == 0, 1e-6, df['Dynamic_Threshold']))**2
     df['Ground_Truth'] = (df['Time'] >= 30.0).astype(int)
         
+    # Calculate the True ROC curve trace using the continuous state profile
     fpr, tpr, thresholds = roc_curve(df['Ground_Truth'], df['NIS'])
     roc_auc = auc(fpr, tpr)
 
@@ -157,15 +158,16 @@ def generate_roc_curve():
     plt.ylabel('True Positive Rate (DR)')
     plt.title('Receiver Operating Characteristic (ROC)', fontsize=11, fontweight='bold')
     
-    fp = len(df[(df['NIS'] >= 15.0) & (df['Ground_Truth'] == 0)])
-    tn = len(df[(df['NIS'] < 15.0) & (df['Ground_Truth'] == 0)])
-    tp = len(df[(df['NIS'] >= 15.0) & (df['Ground_Truth'] == 1)])
-    fn = len(df[(df['NIS'] < 15.0) & (df['Ground_Truth'] == 1)])
+    # FIX: Ground the plotted red operating point directly in runtime detector decisions
+    tp_op = len(df[(df['Alarm_Active'] == 1) & (df['Ground_Truth'] == 1)])
+    fp_op = len(df[(df['Alarm_Active'] == 1) & (df['Ground_Truth'] == 0)])
+    tn_op = len(df[(df['Alarm_Active'] == 0) & (df['Ground_Truth'] == 0)])
+    fn_op = len(df[(df['Alarm_Active'] == 0) & (df['Ground_Truth'] == 1)])
     
-    actual_far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    actual_dr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    actual_far = fp_op / (fp_op + tn_op) if (fp_op + tn_op) > 0 else 0.0
+    actual_dr = tp_op / (tp_op + fn_op) if (tp_op + fn_op) > 0 else 0.0
     
-    plt.scatter(actual_far, actual_dr, color="red", s=60, zorder=5, label=r"Operating Point ($\tau=15.0$)")
+    plt.scatter(actual_far, actual_dr, color="red", s=60, zorder=5, label="True Operating Point")
     plt.legend(loc="lower right", fontsize=9)
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
