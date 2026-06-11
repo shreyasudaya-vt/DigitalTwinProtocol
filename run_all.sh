@@ -43,7 +43,7 @@ fuser -k 5000/udp 2>/dev/null
 sleep 1
 
 # Define your IEEE evaluation scenarios
-SCENARIOS=("Scenario_A" "Scenario_C")
+SCENARIOS=("Scenario_A" "Scenario_B" "Scenario_C" "Scenario_D")
 
 #"Scenario_A" "Scenario_B" "Scenario_C" "Scenario_D"
 
