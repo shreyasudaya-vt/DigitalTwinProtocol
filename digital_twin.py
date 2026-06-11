@@ -165,13 +165,14 @@ class DigitalTwinServer:
                 spatial_residual = abs(self.vel_error_integral)
                 kinematic_drift = self.vel_error_integral  
                 
-                # FIX: Set strictly to 3.0 to perfectly match the paper's spatial bounds
-                if spatial_residual > 3.0 and telemetry > 25.0:
+                # PARAMETER TWEAK: Spatial threshold 3.0 -> 4.0
+                if spatial_residual > 4.0 and telemetry > 25.0:
                     self._spatial_counter += 1
                 else:
                     self._spatial_counter = max(0, self._spatial_counter - 1)
 
-                if self._spatial_counter >= 5: 
+                # PARAMETER TWEAK: Spatial counter 5 -> 10
+                if self._spatial_counter >= 10: 
                     spatial_alarm = 1
 
         self.last_vel = sens_vel
@@ -210,9 +211,9 @@ class DigitalTwinServer:
             innovation = float(health_drift - self.kf.x[0, 0])
             S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
             
-            # FIX: Introduce the absolute noise floor (0.015) to prevent FAR spikes from microscopic thresholds!
-            dyn_threshold = float(3.0 * np.sqrt(S_pre))
-            threshold = max(0.015, dyn_threshold)
+            # PARAMETER TWEAK: Envelope 3.0 -> 3.5 | Floor 0.015 -> 0.025
+            dyn_threshold = float(3.5 * np.sqrt(S_pre))
+            threshold = max(0.025, dyn_threshold)
             
             id_alarm = 0
             health_alarm = 0
@@ -222,10 +223,10 @@ class DigitalTwinServer:
                 self.consecutive_anomalies = 0
                 self.is_locked_out = False
             else:
-                # FIX: Set to 8 exactly to match the dashed line in your Figure C plot!
-                if hd > 8 and pdr > 0.85:
+                # PARAMETER TWEAK: ID threshold 8 -> 12 | Counter 5 -> 10
+                if hd > 12 and pdr > 0.85:
                     self._id_anomalies += 1
-                    if self._id_anomalies >= 5: id_alarm = 1
+                    if self._id_anomalies >= 10: id_alarm = 1
                 else:
                     self._id_anomalies = max(0, self._id_anomalies - 1)
 
@@ -235,11 +236,11 @@ class DigitalTwinServer:
                     self.consecutive_anomalies = 0
                     self.blackout_recovery = False
                     
-                # FIX: Pure Coasting. If breached, skip the update completely. This blasts DR and AUC to the ceiling.
                 elif abs(innovation) > threshold or id_alarm:
                     if not id_alarm and pdr >= 0.80 and abs(innovation) > threshold:
                         self.consecutive_anomalies = min(30, self.consecutive_anomalies + 1)
-                        if self.consecutive_anomalies >= 15: health_alarm = 1
+                        # PARAMETER TWEAK: Health Counter 15 -> 20
+                        if self.consecutive_anomalies >= 20: health_alarm = 1
                     else:
                         self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
                 else:
@@ -304,9 +305,9 @@ class DigitalTwinServer:
             self.kf.predict()
             estimated_health = float(self.kf.x[0, 0])
             
-            # FIX: Tie the noise floor cleanly into Tier 2 as well
-            dyn_threshold = float(3.0 * np.sqrt(float(self.kf.P[0, 0] + self.kf.R[0, 0])))
-            threshold = max(0.015, dyn_threshold)
+            # PARAMETER TWEAK: Envelope 3.0 -> 3.5 | Floor 0.015 -> 0.025
+            dyn_threshold = float(3.5 * np.sqrt(float(self.kf.P[0, 0] + self.kf.R[0, 0])))
+            threshold = max(0.025, dyn_threshold)
 
             unobserved = 128 - len(self.resolved_bits)
             if unobserved > 0:
@@ -329,9 +330,10 @@ class DigitalTwinServer:
             hd = int(np.sum(final_bits != self.baseline_k_auth_bits))
             
             id_alarm = 0
-            if telemetry >= 25.0 and self.warmup_count >= self.WARMUP_PACKETS and hd > 8 and pdr > 0.85:
+            # PARAMETER TWEAK: ID threshold 8 -> 12 | Counter 5 -> 10
+            if telemetry >= 25.0 and self.warmup_count >= self.WARMUP_PACKETS and hd > 12 and pdr > 0.85:
                 self._id_anomalies += 1
-                if self._id_anomalies >= 5: id_alarm = 1
+                if self._id_anomalies >= 10: id_alarm = 1
             else:
                 self._id_anomalies = max(0, self._id_anomalies - 1)
 
