@@ -18,6 +18,7 @@ class DigitalTwinServer:
         self.feedback_address = (feedback_ip, feedback_port)
         self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.blackout_recovery = False
+        self.scenario_name = scenario_name
         self.master_key = master_key
         self.salt = salt
         self.received_packets = 0
@@ -45,7 +46,6 @@ class DigitalTwinServer:
         self.kf.P = np.array([[1.0, 0.0], [0.0, 1.0]])
         self.kf.R = np.array([[0.005**2]]) 
         
-        # Optimized Q Matrix: Locks in a slow, steady degradation slope
         self.kf.Q = np.array([
             [1e-4, 0.0], 
             [0.0, 1e-6]
@@ -54,6 +54,11 @@ class DigitalTwinServer:
         self.warmup_count = 0
         self.WARMUP_PACKETS = 25
         self.start_time = time.time()
+        
+        # Core metric registers
+        self.vel_error_integral = 0.0
+        self._spatial_counter = 0
+        self._id_anomalies = 0
         
         self.log_filename = f"telemetry_{scenario_name}.csv"
         self.log_file = open(self.log_filename, "w", newline="")
@@ -119,7 +124,6 @@ class DigitalTwinServer:
         self.warmup_count += 1
         self.received_packets += 1
         
-        # Calculate PDR
         if self.last_seq == -1:
             self.pdr_window.append(1)
         else:
@@ -133,13 +137,10 @@ class DigitalTwinServer:
         pdr = sum(self.pdr_window) / max(1, len(self.pdr_window))
         self.tx_sock.sendto(struct.pack(">f", pdr), self.feedback_address)
 
-        # --- FIXED dt CALCULATION: Track true simulation time ---
         prev_telemetry_time = getattr(self, 'last_telemetry_time', None)
         if prev_telemetry_time is not None:
             dt = telemetry - prev_telemetry_time
-            # Guard against out-of-order packets causing negative time
-            if dt <= 0: 
-                dt = 0.01
+            if dt <= 0: dt = 0.01
         else:
             dt = 0.01
         if dt > 5.0:
@@ -157,30 +158,30 @@ class DigitalTwinServer:
         spatial_residual = 0.0
         expected_accel = 0.0
 
-        
+        # --- Spatial Evaluation Verification Pipeline ---
         if hasattr(self, 'last_vel') and prev_telemetry_time is not None:
             dt_spatial = telemetry - prev_telemetry_time
             if dt_spatial > 0.001:
                 raw_expected_accel = (sens_vel - self.last_vel) / dt_spatial
-
-                # EWMA: smooths residual noise without lagging the hijack step response
                 alpha = 0.5
                 self._smooth_exp_accel = alpha * raw_expected_accel + (1 - alpha) * getattr(
                     self, '_smooth_exp_accel', raw_expected_accel
                 )
                 expected_accel = self._smooth_exp_accel
 
-                spatial_residual = abs(expected_accel - sens_accel)
+                step_kinematic_mismatch = (sens_accel * dt_spatial) - (sens_vel - self.last_vel)
+                self.vel_error_integral += step_kinematic_mismatch
+                self.vel_error_integral *= 0.965  # Clear high-frequency noise profiles quickly
                 
-                if spatial_residual > 5.0 and telemetry > 25.0:
-                    self._spatial_counter = getattr(self, '_spatial_counter', 0) + 1
+                spatial_residual = abs(self.vel_error_integral)
+                
+                if spatial_residual > 0.65 and telemetry > 25.0:
+                    self._spatial_counter += 1
                 else:
-                    self._spatial_counter = max(0, getattr(self, '_spatial_counter', 0) - 1)
+                    self._spatial_counter = max(0, self._spatial_counter - 1)
 
-                if getattr(self, '_spatial_counter', 0) >= 5:
+                if self._spatial_counter >= 10:  # Require 10 consecutive frames (~0.1s confirmation runway)
                     spatial_alarm = 1
-                    print(f"   🚨 PHASE 3 ALARM: Transducer Hijacking! "
-                        f"Expected: {expected_accel:.2f}, Reported: {sens_accel:.2f}")                   
 
         self.last_vel = sens_vel
 
@@ -191,16 +192,12 @@ class DigitalTwinServer:
             p_auth = payload[:16]
             p_health_bytes = payload[16:144]
 
-            # 1. Safe Float Deserialization & Sanity Check
             if len(p_health_bytes) == 128:
                 try:
                     k_health_rec = np.array(struct.unpack(">32f", p_health_bytes))
-                    
-                    # Prevent mangled channel floats from poisoning the tracker
                     if np.any(np.isnan(k_health_rec)) or np.any(np.isinf(k_health_rec)) or np.any(np.abs(k_health_rec) > 100.0):
                         raise ValueError("Mangled floats detected due to RF channel noise.")
                 except (struct.error, ValueError):
-                    # Coast gracefully using prior state if frame is corrupted
                     k_health_rec = self.baseline_k_health if self.baseline_k_health is not None else np.zeros(32)
             else:
                 k_health_rec = self.baseline_k_health if self.baseline_k_health is not None else np.zeros(32)
@@ -223,63 +220,49 @@ class DigitalTwinServer:
             innovation = float(health_drift - self.kf.x[0, 0])
             S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
             
-            # Dynamic Sigma for FAR/TDR optimization
             sigma_multiplier = 7.0 if pdr >= 0.90 else 8.0
             dyn_threshold = float(sigma_multiplier * np.sqrt(S_pre))
             threshold = max(0.015, dyn_threshold)
-            alarm_triggered = 0
+            
+            id_alarm = 0
+            health_alarm = 0
             
             if telemetry < 25.0 or self.warmup_count < self.WARMUP_PACKETS:
                 self.kf.update(np.array([[health_drift]]))
                 self.consecutive_anomalies = 0
-                alarm_triggered = 0
                 self.is_locked_out = False
             else:
-                # 1. Identity Spoofing Check (Independent of tracking health)
-                if hd > 12 and pdr > 0.85:
-                    self._id_anomalies = getattr(self, '_id_anomalies', 0) + 1
-                    if self._id_anomalies >= 5:
-                        print(f"    🚨 ALARM: Confirmed Identity Spoofing! (HD: {hd} | PDR: {pdr:.2f})")
-                        alarm_triggered = 1
+                if hd > 16 and pdr > 0.85:
+                    self._id_anomalies += 1
+                    if self._id_anomalies >= 8: id_alarm = 1
                 else:
-                    self._id_anomalies = max(0, getattr(self, '_id_anomalies', 0) - 1)
-                    alarm_triggered = 0
-                # 2. Network Blackout State Recovery
-                if self.blackout_recovery and not alarm_triggered:
+                    self._id_anomalies = max(0, self._id_anomalies - 1)
+
+                if self.blackout_recovery and not id_alarm:
                     self.kf.x = np.array([[health_drift], [0.0006]])
                     self.kf.P = np.array([[1e-4, 0.0], [0.0, 1e-4]])
                     self.consecutive_anomalies = 0
-                    alarm_triggered = 0
                     self.blackout_recovery = False
                     
-                # 3. Structural Innovation Breach Evaluation
-                elif abs(innovation) > threshold and not alarm_triggered:
-                    if pdr < 0.80:
-                        # Coast defensively through wireless dropouts without dropping filter state
-                        alarm_triggered = 0
-                    else:
-                        # Increment anomaly counter (cap at 30 to prevent integer windup)
+                elif abs(innovation) > threshold and not id_alarm:
+                    if pdr >= 0.80:
                         self.consecutive_anomalies = min(30, self.consecutive_anomalies + 1)
-                        print(f"   ⚠️ Physical Deviation Detected (Innov: {abs(innovation):.4f}) | Counter: {self.consecutive_anomalies}/12")
-                        
-                        # Requires persistent consecutive breaches to flag a true stealth ramp attack
-                        if self.consecutive_anomalies >= 25:
-                            alarm_triggered = 1
-                        else:
-                            self.kf.update(np.array([[health_drift]]))
-                            alarm_triggered = 0  
-                elif not alarm_triggered:
-                    # 4. Clean, Verified State: Gracefully cool down the anomaly accumulator
+                        if self.consecutive_anomalies >= 22: health_alarm = 1
+                    else:
+                        # Cool down defensively during channel dropouts to prevent false alarms
+                        self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
+                else:
                     self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
                     self.kf.update(np.array([[health_drift]]))
-                    
+
+            alarm_triggered = 1 if (id_alarm or health_alarm or spatial_alarm) else 0
 
             self.csv_writer.writerow([
                 telemetry, seq, tier_id, pdr, hd,
                 health_drift, float(self.kf.x[0, 0]), float(self.kf.P[0, 0]),
                 innovation, threshold, alarm_triggered,
                 sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm 
-                ])
+            ])
             self.log_file.flush()
 
         elif tier_id == 2:
@@ -312,8 +295,7 @@ class DigitalTwinServer:
                 degree_1_nodes = [n for n in self.bp_graph if len(n['indices']) == 1]
                 
                 for node in degree_1_nodes:
-                    if len(node['indices']) != 1:
-                        continue
+                    if len(node['indices']) != 1: continue
                         
                     idx = list(node['indices'])[0]
                     if idx not in self.resolved_bits:
@@ -330,20 +312,18 @@ class DigitalTwinServer:
             self.kf.F[0, 1] = dt
             self.kf.predict()
             estimated_health = float(self.kf.x[0, 0])
-            threshold =  float(5.0 * np.sqrt(float(self.kf.P[0, 0] + self.kf.R[0, 0])))
+            threshold = float(5.0 * np.sqrt(float(self.kf.P[0, 0] + self.kf.R[0, 0])))
 
             unobserved = 128 - len(self.resolved_bits)
             if unobserved > 0:
                 self.csv_writer.writerow([
                     telemetry, seq, tier_id, pdr, -1, 
-                    np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, 0,
-                    sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm # <-- ADDED
+                    np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, spatial_alarm,
+                    sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm
                 ])
                 self.log_file.flush()
                 return
 
-            print(f"📊 LT Belief Propagation Avalanche Complete! Packets required: {self.received_packets_since_tier_drop}")
-            
             final_bits = np.zeros(128, dtype=np.uint8)
             for idx in range(128):
                 final_bits[idx] = self.resolved_bits[idx]
@@ -353,13 +333,21 @@ class DigitalTwinServer:
                 self.is_enrolled = True
 
             hd = int(np.sum(final_bits != self.baseline_k_auth_bits))
-            alarm_triggered = 1 if (self.warmup_count >= self.WARMUP_PACKETS and hd > 15) else 0
-            if not alarm_triggered and self.is_enrolled:
-                pass
+            
+            # --- Fix: Unified Identity Mitigation Buffer for Tier 2 ---
+            id_alarm = 0
+            if self.warmup_count >= self.WARMUP_PACKETS and hd > 16 and pdr > 0.85:
+                self._id_anomalies += 1
+                if self._id_anomalies >= 8: id_alarm = 1
+            else:
+                self._id_anomalies = max(0, self._id_anomalies - 1)
+
+            alarm_triggered = 1 if (id_alarm or spatial_alarm) else 0
+
             self.csv_writer.writerow([
                 telemetry, seq, tier_id, pdr, hd,
                 np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, alarm_triggered,
-                sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm # <-- ADDED
+                sens_vel, sens_accel, expected_accel, spatial_residual, spatial_alarm
             ])
             self.log_file.flush()
             
