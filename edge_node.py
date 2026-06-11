@@ -228,7 +228,7 @@ if __name__ == "__main__":
             # 2. SCENARIO ISOLATION LOGIC (Scientifically Rigorous Profiles)
             if scenario == "Scenario_A":
                 # FIXED: Use elapsed_time so the curve grows over real seconds, not milliseconds
-                aging_drift = 0.002 * (np.exp(0.015 * elapsed_time) - 1.0)
+                aging_drift = 0.0005 * elapsed_time
                 current_health = [val + (aging_drift / np.sqrt(32)) for val in k_health]
 
             elif scenario == "Scenario_C":
