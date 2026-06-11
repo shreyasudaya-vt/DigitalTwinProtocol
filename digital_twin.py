@@ -47,8 +47,8 @@ class DigitalTwinServer:
         
         # Optimized Q Matrix: Locks in a slow, steady degradation slope
         self.kf.Q = np.array([
-            [1e-5, 0.0], 
-            [0.0, 1e-5]
+            [1e-4, 0.0], 
+            [0.0, 1e-6]
         ])
     
         self.warmup_count = 0
@@ -148,8 +148,8 @@ class DigitalTwinServer:
         self.last_telemetry_time = telemetry
 
         self.last_packet_timestamp = timestamp
-        R_base = 0.005**2
-        alpha_noise = 5.0
+        R_base = 0.002**2
+        alpha_noise = 0.01
         self.kf.R = np.array([[R_base + alpha_noise * (1.0 - pdr)]])
 
         n_i, s_i = self._generate_crypto_masks(seq)
@@ -224,8 +224,9 @@ class DigitalTwinServer:
             S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
             
             # Dynamic Sigma for FAR/TDR optimization
-            sigma_multiplier = 6.0 if pdr >= 0.90 else 8.0
-            threshold = float(sigma_multiplier * np.sqrt(S_pre))
+            sigma_multiplier = 7.0 if pdr >= 0.90 else 8.0
+            dyn_threshold = float(sigma_multiplier * np.sqrt(S_pre))
+            threshold = max(0.015, dyn_threshold)
             alarm_triggered = 0
             
             if telemetry < 25.0 or self.warmup_count < self.WARMUP_PACKETS:

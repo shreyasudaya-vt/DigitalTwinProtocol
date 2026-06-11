@@ -26,7 +26,7 @@ static const double P_JAM_DBM     = 13.0;   // Jammer EIRP (20 mW; calibrated so
                                              // the PDR drop shown in Fig 3a of the paper)
 static const double N0_DBM        = -100.0; // Thermal noise floor at receiver (dBm)
 static const double PATH_LOSS_EXP = 2.5;    // Path-loss exponent (outdoor suburban)
-static const uint32_t HEADER_LEN  = 14;     // ANASTA header bytes: preserved from corruption
+static const uint32_t HEADER_LEN  = 21;     // ANASTA header bytes: preserved from corruption
 
 static inline double dBm_to_watts(double dBm) {
     return std::pow(10.0, (dBm - 30.0) / 10.0);
