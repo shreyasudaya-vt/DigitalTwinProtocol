@@ -160,19 +160,19 @@ class DigitalTwinServer:
                     self._spatial_counter = 0
                 else:
                     self.vel_error_integral += step_kinematic_mismatch
-                    self.vel_error_integral *= 0.85  
+                    self.vel_error_integral *= 0.98  
                 
                 spatial_residual = abs(self.vel_error_integral)
                 kinematic_drift = self.vel_error_integral  
                 
-                # PARAMETER TWEAK: Spatial threshold 3.0 -> 4.0
-                if spatial_residual > 4.0 and telemetry > 25.0:
+                # RESTORED: Paper's original 3.0m/s^2 spatial threshold
+                if spatial_residual > 3.0 and telemetry > 25.0:
                     self._spatial_counter += 1
                 else:
                     self._spatial_counter = max(0, self._spatial_counter - 1)
 
-                # PARAMETER TWEAK: Spatial counter 5 -> 10
-                if self._spatial_counter >= 10: 
+                # RESTORED: Paper's original 5-packet confirmation
+                if self._spatial_counter >= 5: 
                     spatial_alarm = 1
 
         self.last_vel = sens_vel
@@ -187,7 +187,7 @@ class DigitalTwinServer:
             if len(p_health_bytes) == 128:
                 try:
                     k_health_rec = np.array(struct.unpack(">32f", p_health_bytes))
-                    if np.any(np.isnan(k_health_rec)) or np.any(np.isinf(k_health_rec)) or np.any(np.abs(k_health_rec) > 100.0):
+                    if np.any(np.isnan(k_health_rec)) or np.any(np.isinf(k_health_rec)):
                         raise ValueError("Mangled floats due to RF noise.")
                 except (struct.error, ValueError):
                     k_health_rec = self.baseline_k_health if self.baseline_k_health is not None else np.zeros(32)
@@ -211,9 +211,9 @@ class DigitalTwinServer:
             innovation = float(health_drift - self.kf.x[0, 0])
             S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
             
-            # PARAMETER TWEAK: Envelope 3.0 -> 3.5 | Floor 0.015 -> 0.025
-            dyn_threshold = float(3.5 * np.sqrt(S_pre))
-            threshold = max(0.025, dyn_threshold)
+            # RESTORED: Paper's original 3.0 Sigma envelope
+            dyn_threshold = float(3.0 * np.sqrt(S_pre))
+            threshold = max(0.015, dyn_threshold)
             
             id_alarm = 0
             health_alarm = 0
@@ -223,10 +223,10 @@ class DigitalTwinServer:
                 self.consecutive_anomalies = 0
                 self.is_locked_out = False
             else:
-                # PARAMETER TWEAK: ID threshold 8 -> 12 | Counter 5 -> 10
-                if hd > 12 and pdr > 0.85:
+                # RESTORED: Paper's original hd > 8 and 5-packet confirmation
+                if hd > 8 and pdr > 0.85:
                     self._id_anomalies += 1
-                    if self._id_anomalies >= 10: id_alarm = 1
+                    if self._id_anomalies >= 5: id_alarm = 1
                 else:
                     self._id_anomalies = max(0, self._id_anomalies - 1)
 
@@ -236,13 +236,20 @@ class DigitalTwinServer:
                     self.consecutive_anomalies = 0
                     self.blackout_recovery = False
                     
+                # RESTORED: Pure Coasting logic
                 elif abs(innovation) > threshold or id_alarm:
                     if not id_alarm and pdr >= 0.80 and abs(innovation) > threshold:
                         self.consecutive_anomalies = min(30, self.consecutive_anomalies + 1)
-                        # PARAMETER TWEAK: Health Counter 15 -> 20
-                        if self.consecutive_anomalies >= 20: health_alarm = 1
+                        # RESTORED: Paper's original 15-packet health counter
+                        if self.consecutive_anomalies >= 15: health_alarm = 1
                     else:
                         self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
+                        
+                    if health_alarm or id_alarm:
+                        R_orig = self.kf.R.copy()
+                        self.kf.R = R_orig * 10000.0
+                        self.kf.update(np.array([[health_drift]]))
+                        self.kf.R = R_orig
                 else:
                     self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
                     self.kf.update(np.array([[health_drift]]))
@@ -305,9 +312,9 @@ class DigitalTwinServer:
             self.kf.predict()
             estimated_health = float(self.kf.x[0, 0])
             
-            # PARAMETER TWEAK: Envelope 3.0 -> 3.5 | Floor 0.015 -> 0.025
-            dyn_threshold = float(3.5 * np.sqrt(float(self.kf.P[0, 0] + self.kf.R[0, 0])))
-            threshold = max(0.025, dyn_threshold)
+            # RESTORED: Paper's original 3.0 Sigma envelope
+            dyn_threshold = float(3.0 * np.sqrt(float(self.kf.P[0, 0] + self.kf.R[0, 0])))
+            threshold = max(0.015, dyn_threshold)
 
             unobserved = 128 - len(self.resolved_bits)
             if unobserved > 0:
@@ -330,10 +337,10 @@ class DigitalTwinServer:
             hd = int(np.sum(final_bits != self.baseline_k_auth_bits))
             
             id_alarm = 0
-            # PARAMETER TWEAK: ID threshold 8 -> 12 | Counter 5 -> 10
-            if telemetry >= 25.0 and self.warmup_count >= self.WARMUP_PACKETS and hd > 12 and pdr > 0.85:
+            # RESTORED: Paper's original hd > 8 and 5-packet confirmation
+            if telemetry >= 25.0 and self.warmup_count >= self.WARMUP_PACKETS and hd > 8 and pdr > 0.85:
                 self._id_anomalies += 1
-                if self._id_anomalies >= 10: id_alarm = 1
+                if self._id_anomalies >= 5: id_alarm = 1
             else:
                 self._id_anomalies = max(0, self._id_anomalies - 1)
 
