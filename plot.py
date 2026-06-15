@@ -35,7 +35,7 @@ ALPHA               = 0.0005   # linear health drift rate (units/sec)
 ATTACK_A_ONSET      = 25.0     # Scenario A: stealth drift starts (seconds)
 ATTACK_C_ONSET      = 30.0     # Scenario C: stealth drift starts (seconds)
 ATTACK_C_WINDUP     = 6.0      # seconds until drift is statistically detectable
-ATTACK_D_ONSET      = 150.0    # Scenario D: IMU hijack starts (seconds)
+ATTACK_D_ONSET      = 25.0     # Scenario D: IMU hijack starts (seconds)
 HD_THRESHOLD        = 8        # Hamming distance alarm threshold (bits)
 SPATIAL_THRESHOLD   = 3.0      # Phase-3 consistency threshold (m/s²)
 WARMUP_GATE         = 15.0     # seconds of init noise excluded from all plots
@@ -77,9 +77,6 @@ def _sigma_band(df, state_col='Kalman_State', p_col='Kalman_P', k=3.0):
 def generate_scenario_a_plot():
     """
     Figure 2: Kalman filter tracking a linear stealth health drift.
-    Ground truth: α × (t − t_onset) for t ≥ t_onset, else 0.
-    Matches edge_node.py Scenario A: stealth_drift = 0.0005 * elapsed_attack,
-    applied via k_health[i] += stealth_drift / sqrt(32) per component.
     """
     df = _load("telemetry_Scenario_A.csv",
                ['Time', 'Kalman_State', 'Kalman_P', 'Trust_Score'])
@@ -139,8 +136,6 @@ def generate_scenario_a_plot():
 def generate_scenario_b_plot():
     """
     Figure 3: Dynamic tier switching under RF jamming.
-    Left panel: PDR over time with tier-2 windows shaded.
-    Right panel: Cumulative packet bytes — static vs adaptive protocol.
     """
     df = _load("telemetry_Scenario_B.csv",
                ['Time', 'PDR', 'Tier', 'Kalman_State', 'Kalman_P'])
@@ -149,14 +144,12 @@ def generate_scenario_b_plot():
 
     df = df[df['Time'] > WARMUP_GATE].copy()
 
-    # Cumulative bytes for adaptive protocol (Tier 1 = full, Tier 2 = compressed)
     df['Packet_Bytes']   = np.where(df['Tier'] == 1, TIER1_FULL, TIER2_FULL)
     df['Cumul_Adaptive'] = df['Packet_Bytes'].cumsum() / 1024       # KB
     df['Cumul_Static']   = (np.arange(len(df)) + 1) * TIER1_FULL / 1024
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.8))
 
-    # ── Panel (a): PDR + Tier shading ─────────────────────────────────────────
     tier2_mask = df['Tier'] == 2
     ax1.plot(df['Time'], df['PDR'], color='steelblue', linewidth=1.4, label='Channel PDR')
     ax1.axhline(0.75, color='tomato',   linestyle='--', linewidth=1.0,
@@ -164,7 +157,6 @@ def generate_scenario_b_plot():
     ax1.axhline(0.85, color='seagreen', linestyle='--', linewidth=1.0,
                 label='Recovery Threshold (0.85)')
 
-    # Shade Tier-2 windows
     in_tier2 = False
     t2_start = None
     for i, (t, is_t2) in enumerate(zip(df['Time'], tier2_mask)):
@@ -184,7 +176,6 @@ def generate_scenario_b_plot():
     ax1.legend(fontsize=7)
     ax1.grid(True, linestyle='--', alpha=0.4)
 
-    # Annotate tier labels in the middle of jamming windows
     tier2_times = df['Time'][tier2_mask]
     if not tier2_times.empty:
         mid = tier2_times.mean()
@@ -192,7 +183,6 @@ def generate_scenario_b_plot():
                  color='darkred', bbox=dict(boxstyle='round,pad=0.2',
                                             facecolor='white', alpha=0.7))
 
-    # ── Panel (b): Cumulative overhead ────────────────────────────────────────
     ax2.plot(df['Time'], df['Cumul_Static'],
              color='gray', linestyle='--', linewidth=1.5,
              label=f'Static Protocol ({TIER1_FULL}B/pkt)')
@@ -227,10 +217,7 @@ def generate_scenario_b_plot():
 
 def generate_scenario_c_plot():
     """
-    Figure 4: Multi-layer detection — Hamming distance (identity layer)
-    and Kalman innovation (health layer) over time.
-    Attack onset: ATTACK_C_ONSET = 30s.
-    HD alarm threshold: HD_THRESHOLD = 8 bits (matches digital_twin.py hd > 8).
+    Figure 4: Multi-layer detection
     """
     df = _load("telemetry_Scenario_C.csv",
                ['Time', 'Hamming_Distance', 'Innovation',
@@ -242,7 +229,6 @@ def generate_scenario_c_plot():
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 5.5), sharex=True)
 
-    # ── Panel 1: Hamming distance (identity layer) ────────────────────────────
     ax1.scatter(df['Time'], df['Hamming_Distance'],
                 color='mediumpurple', s=4, alpha=0.55,
                 label='Hamming Distance (HD)')
@@ -255,7 +241,6 @@ def generate_scenario_c_plot():
     ax1.legend(loc='upper left')
     ax1.grid(True, linestyle='--', alpha=0.4)
 
-    # ── Panel 2: Kalman innovation + dynamic threshold (health layer) ─────────
     ax2.plot(df['Time'], df['Innovation'],
              color='steelblue', linewidth=1.0, alpha=0.8,
              label=r'Innovation $\tilde{y}_t = z_t - \hat{h}_{t|t-1}$')
@@ -265,7 +250,6 @@ def generate_scenario_c_plot():
     ax2.plot(df['Time'], -df['Dynamic_Threshold'],
              color='tomato', linestyle='--', linewidth=1.2)
 
-    # Shade alarm-active periods
     alarm_on = df['Alarm_Active'] == 1
     ax2.fill_between(df['Time'], df['Innovation'].min(), df['Innovation'].max(),
                      where=alarm_on, color='tomato', alpha=0.12,
@@ -289,8 +273,6 @@ def generate_scenario_c_plot():
 def generate_scenario_d_plot():
     """
     Figure 5: Phase-3 spatial cross-verification detecting IMU transducer hijack.
-    Attack onset: ATTACK_D_ONSET = 150s.
-    Spatial threshold: SPATIAL_THRESHOLD = 3.0 m/s² (matches digital_twin.py).
     """
     df = _load("telemetry_Scenario_D.csv",
                ['Time', 'Sensor_Vel', 'Sensor_Accel',
@@ -300,32 +282,27 @@ def generate_scenario_d_plot():
 
     df = df[df['Time'] >= 10.0].copy()
 
-    # Expanded to 3 subplots to accommodate Phase 4 Convex Trust Metrics
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(7, 7.5), sharex=True)
 
-    # ── Panel 1: Sensor velocity and acceleration ─────────────────────────────
-    ax1.plot(df['Time'], df['Sensor_Vel'],
-             color='steelblue', linewidth=1.2, label='GPS Velocity $v_t$')
+    # Note: Sensor_Vel is no longer used, so we only plot the IMU Accel vs structural bounds
     ax1.plot(df['Time'], df['Sensor_Accel'],
              color='darkorange', linewidth=1.0, alpha=0.8,
-             label='Reported IMU Accel $a_{rep}$')
+             label='Reported Structural Accel $a_{rep}$')
     ax1.axvline(ATTACK_D_ONSET, color='dimgray', linestyle='--', linewidth=1.0,
                 label=f'Hijack Onset (t={ATTACK_D_ONSET:.0f}s)')
-    ax1.set_ylabel('Velocity (m/s) / Acceleration (m/s²)')
+    ax1.set_ylabel('Acceleration (m/s²)')
     ax1.set_title('Scenario D: Physics-Layer Cross-Verification Against Transducer Hijacking')
     ax1.legend(loc='upper left', fontsize=8)
     ax1.grid(True, linestyle='--', alpha=0.4)
 
-    # ── Panel 2: Spatial residual and alarm ───────────────────────────────────
     ax2.plot(df['Time'], df['Spatial_Residual'],
              color='mediumpurple', linewidth=1.5,
-             label=r'Spatial Residual $r_t = |a_{exp,t} - a_{rep,t}|$')
+             label=r'Mismatch Residual $r_t$')
     ax2.axhline(SPATIAL_THRESHOLD, color='tomato', linestyle='--',
                 linewidth=1.2,
                 label=rf'Consistency Threshold ($\tau_{{spatial}}$ = {SPATIAL_THRESHOLD} m/s²)')
     ax2.axvline(ATTACK_D_ONSET, color='dimgray', linestyle='--', linewidth=1.0)
 
-    # Mark first alarm
     alarms = df[df['Spatial_Alarm'] == 1]
     if not alarms.empty:
         t_alarm   = alarms['Time'].iloc[0]
@@ -342,12 +319,10 @@ def generate_scenario_d_plot():
     ax2.legend(loc='upper left', fontsize=8)
     ax2.grid(True, linestyle='--', alpha=0.4)
 
-    fig.tight_layout()
     ax3.plot(df['Time'], df['Trust_Score'], color='crimson', linewidth=1.5, label=r'Trust Score $T_k^*$')
     ax3.axhline(0.20, color='darkorange', linestyle=':', label='Lockout Threshold (0.2)')
     ax3.axvline(ATTACK_D_ONSET, color='dimgray', linestyle='--', linewidth=1.0)
     
-    # Highlight the Pure Coasting safety enforcement region
     coasting_win = (df['Time'] >= ATTACK_D_ONSET) & (df['Trust_Score'] <= 0.05)
     ax3.fill_between(df['Time'], -0.1, 1.1, where=coasting_win, color='crimson', alpha=0.1, label='Enforced Pure Coasting ($R \to \infty$)')
     
@@ -368,25 +343,6 @@ def generate_scenario_d_plot():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_roc_curve():
-    """
-    Figure 6: Receiver Operating Characteristic for the fused IDS.
-
-    Two distinct quantities are shown:
-      1. Steady-state AUC (orange curve): computed by sweeping the fused
-         risk score over clean (Scenario A, t≥15s) and post-wind-up attack
-         (Scenario C, t≥36s) samples. The 6-second stealth wind-up
-         (t=30s to t=36s) is deliberately excluded because the drift
-         magnitude is below the noise floor by design and no detector
-         could distinguish it from clean baseline.
-
-      2. Operational alarm setpoint (red dot): the actual (FAR, DR) achieved
-         by the alarm logic in digital_twin.py, derived from Alarm_Active.
-         FAR uses the full clean window (t=15s to t<30s, Scenario A).
-         DR uses the post-wind-up attack window (t≥36s, Scenario C).
-
-    These two quantities measure different things and are presented
-    separately in the legend.
-    """
     df_a = _load("telemetry_Scenario_A.csv",
                  ['Time', 'Innovation', 'Hamming_Distance', 'Alarm_Active'])
     df_c = _load("telemetry_Scenario_C.csv",
@@ -394,22 +350,15 @@ def generate_roc_curve():
     if df_a is None or df_c is None:
         return
 
-    # ── Clean baseline: Scenario A, post warm-up ──────────────────────────────
     clean = df_a[df_a['Time'] >= WARMUP_GATE].copy()
     clean['Is_Attack'] = 0
 
-    # ── Attack data: Scenario C, exclude stealth wind-up ─────────────────────
-    # Retain pre-attack portion (t < ATTACK_C_ONSET) for FAR baseline context
-    # and post-wind-up attack portion (t >= ATTACK_C_ONSET + ATTACK_C_WINDUP)
     post_windup_onset = ATTACK_C_ONSET + ATTACK_C_WINDUP   # 36.0s
     attack = df_c[df_c['Time'] >= post_windup_onset].copy()
     attack['Is_Attack'] = 1
 
     roc_df = pd.concat([clean, attack], ignore_index=True)
 
-    # Fused risk score: innovation magnitude + weighted HD contribution
-    # HD is normalised to [0,1] over 128 bits; weighted at 0.1 to prevent
-    # the identity layer from dominating the continuous score.
     roc_df['Fused_Score'] = (
         roc_df['Innovation'].abs()
         + 0.1 * (roc_df['Hamming_Distance'] / 128.0)
@@ -418,18 +367,14 @@ def generate_roc_curve():
     fpr, tpr, _ = roc_curve(roc_df['Is_Attack'], roc_df['Fused_Score'])
     roc_auc = auc(fpr, tpr)
 
-    # ── Operational setpoint from alarm logic ─────────────────────────────────
-    # FAR = fraction of clean packets where Alarm_Active == 1
     clean_window = df_a[
         (df_a['Time'] >= WARMUP_GATE) & (df_a['Time'] < ATTACK_C_ONSET)
     ]
     op_far = (clean_window['Alarm_Active'] == 1).mean()
 
-    # DR  = fraction of steady-state attack packets where Alarm_Active == 1
     ss_attack = df_c[df_c['Time'] >= post_windup_onset]
     op_dr  = (ss_attack['Alarm_Active'] == 1).mean()
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(5, 5))
     ax.plot(fpr, tpr, color='darkorange', lw=2,
             label=f'Steady-State AUC = {roc_auc:.4f}\n'
@@ -460,12 +405,6 @@ def generate_roc_curve():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_bandwidth_plot():
-    """
-    Figure: Average per-packet size — static Tier-1-only protocol
-    vs adaptive ANASTA-Pro.  Uses full packet sizes (header included).
-    If Scenario B telemetry is available the actual Tier-2 fraction is
-    used; otherwise falls back to a 33% jamming-window estimate.
-    """
     df_b = _load("telemetry_Scenario_B.csv", ['Time', 'Tier'])
     if df_b is not None and not df_b.empty:
         tier2_frac = (df_b['Tier'] == 2).mean()
@@ -486,7 +425,6 @@ def generate_bandwidth_plot():
     bars = ax.bar(labels, heights, color=colours, width=0.45, edgecolor='black',
                   linewidth=0.7)
 
-    # Annotate bars with exact byte counts
     for bar, h in zip(bars, heights):
         ax.text(bar.get_x() + bar.get_width() / 2.0, h + 1.5,
                 f'{h:.1f} B', ha='center', va='bottom', fontsize=9)
@@ -522,18 +460,16 @@ def generate_journal_statistics():
 
     # ── Hypothesis 1: Scenario A — Kalman health tracking ────────────────────
     df_a = _load("telemetry_Scenario_A.csv",
-                 ['Time', 'Kalman_State', 'Kalman_P', 'Trust_Score']) # <-- Swapped Raw_Measurement for Trust_Score
+                 ['Time', 'Kalman_State', 'Kalman_P', 'Trust_Score']) 
     if df_a is not None:
         df_a = df_a[df_a['Time'] > WARMUP_GATE].copy()
 
-        # Ground truth: linear drift from ATTACK_A_ONSET (matches edge_node.py)
         df_a['True_Drift'] = np.where(
             df_a['Time'] >= ATTACK_A_ONSET,
             ALPHA * (df_a['Time'] - ATTACK_A_ONSET),
             0.0
         )
 
-        # Restrict metrics to post-onset window where drift is active
         df_track = df_a[df_a['Time'] >= ATTACK_A_ONSET]
         if not df_track.empty:
             corr    = df_track['Kalman_State'].corr(df_track['True_Drift'])
@@ -545,11 +481,9 @@ def generate_journal_statistics():
             print(f"    Observability Correlation (Pearson R) : {corr:.4f}")
             print(f"    Trust-Weighted Filter RMSE            : {rmse_kf:.6f}")
             
-            # Phase 4/5 Metric processing tracking your continuous Trust degradation
             if 'Trust_Score' in df_track.columns:
                 min_trust = df_track['Trust_Score'].min()
                 print(f"    Minimum Trust Score during drift      : {min_trust:.4f}")
-
 
     # ── Hypothesis 2: Scenario B — Bandwidth under jamming ───────────────────
     df_b = _load("telemetry_Scenario_B.csv", ['Time', 'Tier', 'PDR'])
@@ -572,10 +506,6 @@ def generate_journal_statistics():
                  ['Time', 'Hamming_Distance', 'Innovation',
                   'Alarm_Active', 'PDR'])
     if df_c is not None:
-        # Ground truth split aligned with edge_node.py Scenario C
-        # Attack onset: ATTACK_C_ONSET = 30.0s
-        # Clean window: WARMUP_GATE (15s) ≤ t < ATTACK_C_ONSET (30s)
-        # Attack window: t ≥ ATTACK_C_ONSET (30s)
         df_clean  = df_c[
             (df_c['Time'] >= WARMUP_GATE) & (df_c['Time'] < ATTACK_C_ONSET)
         ]
@@ -590,11 +520,9 @@ def generate_journal_statistics():
         far       = (fp / (fp + tn)) * 100 if (fp + tn) > 0 else 0.0
         precision = (tp / (tp + fp)) * 100 if (tp + fp) > 0 else 100.0
 
-        # Detection latency: time from attack onset to first alarm
         first_alarm = df_attack[df_attack['Alarm_Active'] == 1]
         if not first_alarm.empty:
             latency = first_alarm['Time'].iloc[0] - ATTACK_C_ONSET
-            # Steady-state DR: fraction of attack packets AFTER detection fires
             ss_onset = first_alarm['Time'].iloc[0]
             df_ss    = df_attack[df_attack['Time'] > ss_onset]
             ss_dr    = (df_ss['Alarm_Active'] == 1).mean() * 100 \
@@ -603,7 +531,6 @@ def generate_journal_statistics():
             latency = float('nan')
             ss_dr   = float('nan')
 
-        # Steady-state AUC (excluding wind-up)
         post_windup = ATTACK_C_ONSET + ATTACK_C_WINDUP
         df_a2 = _load("telemetry_Scenario_A.csv",
                       ['Time', 'Innovation', 'Hamming_Distance'])
@@ -636,7 +563,7 @@ def generate_journal_statistics():
 
     # ── Hypothesis 4: Scenario D — Transducer hijacking latency ──────────────
     df_d = _load("telemetry_Scenario_D.csv",
-                 ['Time', 'Spatial_Residual', 'Spatial_Alarm', 'Trust_Score'])
+                 ['Time', 'Spatial_Residual', 'Spatial_Alarm', 'Trust_Score', 'Kalman_State'])
     if df_d is not None:
         alarms = df_d[df_d['Spatial_Alarm'] == 1]
         if not alarms.empty:
@@ -651,25 +578,16 @@ def generate_journal_statistics():
             print(f"    Peak spatial residual (post-onset)    : {peak_res:.3f} m/s²")
             print(f"    Spatial threshold                     : {SPATIAL_THRESHOLD} m/s²")
             
-            # Phase 4 Metric Processing
-            # Phase 5 Metric Processing
+            # Phase 4 & 5 Metric Processing
             if 'Trust_Score' in df_d.columns:
                 low_trust_events = df_d[df_d['Trust_Score'] <= 0.2]
                 if not low_trust_events.empty:
                     t_lockout = low_trust_events['Time'].iloc[0]
                     min_trust = df_d[df_d['Time'] >= ATTACK_D_ONSET]['Trust_Score'].min()
                     
-                    # Correct Phase 5 Evaluation: Measure state stability (jitter) during Pure Coasting
-                    pre_attack_jitter = df_d[(df_d['Time'] >= 100.0) & (df_d['Time'] < 150.0)]['Kalman_State'].std()
-                    during_attack_jitter = df_d[df_d['Time'] >= 150.0]['Kalman_State'].std()
-                    stability_retention = (1.0 - (during_attack_jitter / max(1e-5, pre_attack_jitter))) * 100
-                    
-                    print()
-                    print("  [Phase 4 & 5] Convex Trust Enforcement & Coasting")
-                    print(f"    Convex Solver System Lockout Latency  : {t_lockout - ATTACK_D_ONSET:.4f} s")
-                    print(f"    Minimum Trust Reached During Hijack   : {min_trust:.4f}")
-                    pre_attack_jitter = df_d[(df_d['Time'] >= 100.0) & (df_d['Time'] < 150.0)]['Kalman_State'].std()
-                    during_attack_jitter = df_d[df_d['Time'] >= 150.0]['Kalman_State'].std()
+                    # Updated to correctly align with ATTACK_D_ONSET = 25.0s
+                    pre_attack_jitter = df_d[(df_d['Time'] >= WARMUP_GATE) & (df_d['Time'] < ATTACK_D_ONSET)]['Kalman_State'].std()
+                    during_attack_jitter = df_d[df_d['Time'] >= ATTACK_D_ONSET]['Kalman_State'].std()
                     
                     print()
                     print("  [Phase 4 & 5] Convex Trust Enforcement & Coasting")

@@ -4,6 +4,8 @@ import time
 import struct
 import threading
 import numpy as np
+import pandas as pd
+import glob
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from sklearn.decomposition import PCA
@@ -25,6 +27,26 @@ except ImportError:
     USE_PHASE = True
     REF_FREQ = np.linspace(10000, 1000000, 2001)
     HAS_PCA_MODULE = False
+
+def load_pzt_csv_vector(file_path, use_phase=True):
+    """
+    Natively parses the exact laboratory EMIS schema from the 01_master_dataset.
+    Extracts Real Impedance (Rs) and Phase (th) as high-dimensional features.
+    """
+    try:
+        df = pd.read_csv(file_path)
+        # Ensure frequency sorting for dimensional alignment
+        if "Frequency (Hz)" in df.columns:
+            df = df.sort_values("Frequency (Hz)")
+        
+        rs_vector = df["Trace Rs (Ohm)"].values
+        if use_phase and "Trace th (deg)" in df.columns:
+            phase_vector = df["Trace th (deg)"].values
+            return np.concatenate([rs_vector, phase_vector])
+        return rs_vector
+    except Exception as e:
+        print(f"[Parser Error] Could not read file {file_path}: {e}")
+        return None
 
 class AnastaEdgeNode:
     def __init__(self, ns3_ip="127.0.0.1", ns3_port=9000, feedback_port=9001, master_key=b'\x00'*16, salt=b'\x01'*4):
@@ -59,25 +81,31 @@ class AnastaEdgeNode:
 
     def calibrate_from_hardware(self):
         print("[Edge] Calibrating Eigenspace from physical hardware dataset...")
-        if not HAS_PCA_MODULE:
-            self._generate_synthetic_calibration()
-            return
-
-        self.device_files_map = collect_device_files(DEVICE_FOLDER)
-        excluded_set = set(EXCLUDED_DEVICES)
+        
+        # Native collection scan over 01_master_dataset searching for real CSVs
+        csv_files = sorted(glob.glob(os.path.join(DEVICE_FOLDER, "**/*.csv"), recursive=True)) + \
+                    sorted(glob.glob(os.path.join(DEVICE_FOLDER, "*.csv")))
+        
         X_train_rows = []
-        for dev in sorted(self.device_files_map.keys()):
-            if dev in excluded_set: continue
-            for idx in PREFERRED_MULTI_TRAIN_INDICES:
-                if idx in self.device_files_map[dev]:
-                    vec = load_sweep_vector(self.device_files_map[dev][idx], ref_freq=REF_FREQ, use_phase=USE_PHASE)
+        excluded_set = set(EXCLUDED_DEVICES)
+        
+        if csv_files:
+            print(f"[Edge] Discovered {len(csv_files)} files matching the PZT schema in '{DEVICE_FOLDER}'")
+            for f in csv_files:
+                # Basic string filter to bypass excluded profiles
+                if any(ex in os.path.basename(f) for ex in excluded_set):
+                    continue
+                vec = load_pzt_csv_vector(f, use_phase=USE_PHASE)
+                if vec is not None:
                     X_train_rows.append(vec)
-
+                    
         if not X_train_rows:
+            print("[Edge] No physical hardware data found. Falling back to high-fidelity simulation baseline.")
             self._generate_synthetic_calibration()
             return
 
         train_matrix = np.vstack(X_train_rows)
+        # Ensure mathematical dimensionality satisfies PCA requirements via standard noise expansion
         if train_matrix.shape[0] < self.total_components:
             needed = (self.total_components + 10) - train_matrix.shape[0]
             mean_row = train_matrix.mean(axis=0)
@@ -88,9 +116,9 @@ class AnastaEdgeNode:
         self.pca = PCA(n_components=self.total_components)
         self.pca.fit(self.scaler.fit_transform(train_matrix))
         
-        valid_devs = [d for d in self.device_files_map.keys() if d not in excluded_set]
-        self.target_device = valid_devs[0] if valid_devs else list(self.device_files_map.keys())[0]
-        print(f"[Edge] Eigenspace Calibrated! Node bound to hardware Identity profile: Device '{self.target_device}'")
+        self.target_device = "PZT_NODE_01"
+        self.device_files_map = {"PZT_NODE_01": csv_files if csv_files else {}}
+        print(f"[Edge] Eigenspace Calibrated! Node successfully bound to PZT Hardware Schema via Real Resistance Channels.")
 
     def _generate_synthetic_calibration(self):
         feature_len = len(REF_FREQ) * (2 if USE_PHASE else 1)
@@ -135,7 +163,6 @@ class AnastaEdgeNode:
         return n_i, s_i
 
     def _fountain_compress(self, data_bytes, mask_bytes):
-        # TRUE LT ENCODER: Using degree distribution (Soliton-inspired)
         seed = int.from_bytes(mask_bytes, byteorder='big')
         rng = np.random.default_rng(seed)
         bits = np.unpackbits(np.frombuffer(data_bytes, dtype=np.uint8))
@@ -149,7 +176,7 @@ class AnastaEdgeNode:
             indices = rng.choice(128, size=d, replace=False)
             val = 0
             for idx in indices:
-                val ^= bits[idx]  # XOR the multiple source bits
+                val ^= bits[idx]
             encoded_bits[i] = val
             
         return np.packbits(encoded_bits).tobytes()
@@ -167,130 +194,125 @@ class AnastaEdgeNode:
         return k_auth, k_health
 
     def transmit(self, k_auth, k_health, telemetry_val1=0.0, telemetry_val2=0.0, telemetry_val3=0.0):
-            n_i, s_i = self._generate_crypto_masks(self.sequence_counter)
-            header = struct.pack(">IIBfff", int(time.time()), self.sequence_counter, self.current_tier, float(telemetry_val1), float(telemetry_val2), float(telemetry_val3))
+        n_i, s_i = self._generate_crypto_masks(self.sequence_counter)
+        header = struct.pack(">IIBfff", int(time.time()), self.sequence_counter, self.current_tier, float(telemetry_val1), float(telemetry_val2), float(telemetry_val3))
+        
+        if self.current_tier == 1:
+            MAX_FLOAT32 = 3.4028235e38
+            MIN_FLOAT32 = -3.4028235e38
+            sanitized_health = [max(MIN_FLOAT32, min(MAX_FLOAT32, float(x))) for x in k_health]
             
-            if self.current_tier == 1:
-                # 1. SATURATION GUARD: Clip state values to standard 32-bit float limits
-                MAX_FLOAT32 = 3.4028235e38
-                MIN_FLOAT32 = -3.4028235e38
-                sanitized_health = [max(MIN_FLOAT32, min(MAX_FLOAT32, float(x))) for x in k_health]
-                
-                p_auth = bytes(a ^ b for a, b in zip(k_auth, n_i))
-                
-                # 2. PACK SANITIZED VALUES: Safe from OverflowErrors
-                p_health = struct.pack(">32f", *sanitized_health)
-                packet = header + p_auth + p_health
-            else:
-                k_auth_comp = self._fountain_compress(k_auth, s_i)
-                n_i_comp = self._fountain_compress(n_i, s_i)
-                p_fountain = bytes(a ^ b for a, b in zip(k_auth_comp, n_i_comp))
-                packet = header + p_fountain
-                
-            self.tx_sock.sendto(packet, self.ns3_address)
-            print(f"[Edge] Sent Seq {self.sequence_counter} | Tier {self.current_tier} | Size: {len(packet)}B")
-            self.sequence_counter += 1
+            p_auth = bytes(a ^ b for a, b in zip(k_auth, n_i))
+            p_health = struct.pack(">32f", *sanitized_health)
+            packet = header + p_auth + p_health
+        else:
+            k_auth_comp = self._fountain_compress(k_auth, s_i)
+            n_i_comp = self._fountain_compress(n_i, s_i)
+            p_fountain = bytes(a ^ b for a, b in zip(k_auth_comp, n_i_comp))
+            packet = header + p_fountain
+            
+        self.tx_sock.sendto(packet, self.ns3_address)
+        print(f"[Edge] Sent Seq {self.sequence_counter} | Tier {self.current_tier} | Size: {len(packet)}B")
+        self.sequence_counter += 1
 
     def close(self):
         self.running = False
         self.feedback_sock.close()
         self.tx_sock.close()
 
+
 if __name__ == "__main__":
     node = AnastaEdgeNode()
     node.calibrate_from_hardware()
     
-    dev_sweeps = node.device_files_map.get(node.target_device, {})
-    if len(dev_sweeps) > 0:
-        first_available_idx = sorted(dev_sweeps.keys())[0]
-        stable_base_vector = load_sweep_vector(dev_sweeps[first_available_idx], ref_freq=REF_FREQ, use_phase=USE_PHASE)
+    # Extract real CSV sweep catalogs
+    all_real_csvs = node.device_files_map.get(node.target_device, [])
+    
+    if len(all_real_csvs) > 0:
+        print(f"[Main] Ingesting real hardware base vector from baseline file: {os.path.basename(all_real_csvs[0])}")
+        stable_base_vector = load_pzt_csv_vector(all_real_csvs[0], use_phase=USE_PHASE)
     else:
-        stable_base_vector = np.random.randn(len(REF_FREQ) * (2 if USE_PHASE else 1))
+        feature_len = len(REF_FREQ) * (2 if USE_PHASE else 1)
+        stable_base_vector = np.random.randn(feature_len)
         
-    scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_A"
+    scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_D"
     scaled_base = node.scaler.transform(stable_base_vector.reshape(1, -1))
     proj_base = node.pca.transform(scaled_base)[0]
     w_high_base = proj_base[:node.n_identity]
-    
-    # 0.05 is a standard PCA threshold to filter out the noise floor
     stable_indices = np.where(np.abs(w_high_base) > 0.05)[0]
 
-    sweep_idx = 1
+    sweep_idx = 0
     stealth_drift = 0.0
     start_time = time.time()
+    
+    print(f"\n🚀 SHM Vehicle Verification Environment Active. Running: {scenario}\n")
+    
     try:
         while True:
-            # 1. Base Hardware Readout with realistic thermal noise
-            thermal_noise = np.random.normal(0, 0.0005, len(stable_base_vector))
-            real_sweep = stable_base_vector + thermal_noise
-            k_auth, k_health = node.transform_hardware_sweep(real_sweep)
-            current_health = list(k_health)
             elapsed_time = time.time() - start_time
 
-            # ==========================================================
-            # TIME SCALING: Convert raw iterations into real elapsed seconds
-            # ==========================================================
-            
+            # ------------------------------------------------------------------
+            # STEP 1: PHYSICAL HARDWARE IMPEDANCE INGESTION
+            # ------------------------------------------------------------------
+            if len(all_real_csvs) > 0:
+                # Dynamically index files sequentially to pull genuine PZT sweep vectors
+                target_file = all_real_csvs[sweep_idx % len(all_real_csvs)]
+                real_sweep = load_pzt_csv_vector(target_file, use_phase=USE_PHASE)
+                if real_sweep is None:
+                    real_sweep = stable_base_vector
+            else:
+                # Maintain mathematical noise variance floor if dataset files are absent
+                thermal_noise = np.random.normal(0, 0.0005, len(stable_base_vector))
+                real_sweep = stable_base_vector + thermal_noise
+                
+            k_auth, k_health = node.transform_hardware_sweep(real_sweep)
+            current_health = list(k_health)
 
-            # 2. SCENARIO ISOLATION LOGIC (Scientifically Rigorous Profiles)
+            # ------------------------------------------------------------------
+            # STEP 2: PURE SHM CROSS-LAYER SCENARIO ENGINE
+            # ------------------------------------------------------------------
             if scenario == "Scenario_A":
                 if elapsed_time >= 25.0:
-                        elapsed_attack = elapsed_time - 25.0
-                        # FIXED: Linear stealth drift matching the paper
-                        stealth_drift = 0.0005 * elapsed_attack
-                        for i in range(len(k_health)):
-                            k_health[i] += (stealth_drift/np.sqrt(32))
+                    elapsed_attack = elapsed_time - 25.0
+                    stealth_drift = 0.0005 * elapsed_attack
+                    for i in range(len(k_health)):
+                        k_health[i] += (stealth_drift / np.sqrt(32))
                 current_health = k_health
 
             elif scenario == "Scenario_C":
-                # FIXED: Wait for 30 real seconds, then add drift scaled by dt
                 if elapsed_time >= 30.0:
-                    stealth_drift += (0.015 * 0.01) 
-                    #current_health = [val + (stealth_drift / np.sqrt(32)) for val in k_health]
                     current_health = [val + 0.25 for val in k_health]
 
             elif scenario == "Scenario_D":
-                # FIXED: Add a small random walk component every 10 seconds
-                true_accel = 5.0 * np.sin(0.2 * elapsed_time)
+                # SIMULATING SHM VEHICLE OPERATIONAL VIBRATIONS (Chassis bouncing on terrain)
+                true_structural_accel = 1.8 * np.sin(0.4 * elapsed_time)
                 
-                if not hasattr(node, 'true_vel'): 
-                    node.true_vel = 0.0
-                if not hasattr(node, 'last_scenario_d_time'):
-                    node.last_scenario_d_time = elapsed_time
-                dt_actual = elapsed_time - node.last_scenario_d_time
-                node.last_scenario_d_time = elapsed_time
-                node.true_vel += true_accel * dt_actual
-                # Integrate acceleration to get velocity
+                # Raw sensor readings under normal environmental noise
+                sensor_accel = true_structural_accel + np.random.normal(0, 0.15)
                 
-                # 2. Add standard transducer noise
-                sensor_vel = node.true_vel + np.random.normal(0, 0.005) # GPS 
-                sensor_accel = true_accel + np.random.normal(0, 0.5)  # IMU
-                
-                # 3. TRANSDUCER HIJACKING ATTACK: At t=150s, attacker manipulates the IMU
+                # TRANSDUCER HIJACKING ATTACK: Exactly at t=150s, attacker spoofs fake collision/damage
                 if elapsed_time >= 150.0:
-                    sensor_accel += 15.0 # Fake massive acceleration spike
+                    sensor_accel += 15.0  # Spikes kinematic telemetry line maliciously
                 
-                current_health = [val for val in k_health] # Keep health baseline flat
+                # THE CROSS-MODAL CONTRADDICTION: Maintain a completely clean, uncompromised material health matrix.
+                # If a real structural collapse occurred, 'current_health' would warp drastically.
+                # Keeping it flat forces the Digital Twin to detect the telemetry mismatch instantly.
+                current_health = [val for val in k_health]
 
-            
-                # Transmit the expanded telemetry payload
-                
+            # ------------------------------------------------------------------
+            # STEP 3: TELEMETRY ENCAPSULATION AND PACKET EMISSION
+            # ------------------------------------------------------------------
             try:
-                # Your existing transmission line (Line 218)
                 if scenario == "Scenario_D":
-                    node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=sensor_vel, telemetry_val3=sensor_accel)
-                
+                    # val1 = clock, val2 = 0.0 (Velocity stripped), val3 = Structural Acceleration
+                    node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=0.0, telemetry_val3=sensor_accel)
                 else:
-                    # Legacy support for Scenarios A, B, C
                     node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=0.0, telemetry_val3=0.0)
                 
                 sweep_idx += 1
-                
-                # Keep our high-speed 1ms pacing
-                time.sleep(0.01)
+                time.sleep(0.01)  # Strict 10ms framework pacing
 
             except (BrokenPipeError, ConnectionResetError, OSError):
-                # Catch the socket closure when NS-3 finishes unthrottled execution
                 print("🔌 NS-3 simulation socket closed. Terminating edge node loop cleanly.")
                 break
     except KeyboardInterrupt:
