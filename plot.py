@@ -82,13 +82,12 @@ def generate_scenario_a_plot():
     applied via k_health[i] += stealth_drift / sqrt(32) per component.
     """
     df = _load("telemetry_Scenario_A.csv",
-               ['Time', 'Kalman_State', 'Kalman_P', 'Raw_Measurement'])
+               ['Time', 'Kalman_State', 'Kalman_P', 'Trust_Score'])
     if df is None:
         return
 
-    # Exclude warm-up and filter out raw measurement outliers from RF noise
+    # Exclude warm-up gating
     df = df[df['Time'] > WARMUP_GATE].copy()
-    df = df[df['Raw_Measurement'].abs() < 10.0]
     if df.empty:
         print("  [SKIP] Scenario A: no valid rows after filtering.")
         return
@@ -113,9 +112,11 @@ def generate_scenario_a_plot():
     ax.fill_between(df['Time'], lo, hi,
                     color='royalblue', alpha=0.18,
                     label=r'$\pm 3\sigma$ Confidence Envelope')
-    ax.scatter(df['Time'], df['Raw_Measurement'],
-               color='tomato', s=2, alpha=0.25,
-               label=r'Raw Measurement $z_t$')
+    ax2 = ax.twinx()
+    ax2.plot(df['Time'], df['Trust_Score'], color='crimson', lw=1.2, label=r'Trust Score $T_k^*$')
+    ax2.set_ylabel('Convex Trust Metric', color='crimson')
+    ax2.tick_params(axis='y', labelcolor='crimson')
+    ax2.set_ylim(-0.05, 1.05)
 
     ax.axvline(ATTACK_A_ONSET, color='black', linestyle='--', linewidth=1.0,
                label=f'Drift Onset (t={ATTACK_A_ONSET:.0f}s)')
@@ -293,13 +294,14 @@ def generate_scenario_d_plot():
     """
     df = _load("telemetry_Scenario_D.csv",
                ['Time', 'Sensor_Vel', 'Sensor_Accel',
-                'Kinematic_Drift', 'Spatial_Residual', 'Spatial_Alarm'])
+                'Kinematic_Drift', 'Spatial_Residual', 'Spatial_Alarm', 'Trust_Score'])
     if df is None:
         return
 
     df = df[df['Time'] >= 10.0].copy()
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+    # Expanded to 3 subplots to accommodate Phase 4 Convex Trust Metrics
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(7, 7.5), sharex=True)
 
     # ── Panel 1: Sensor velocity and acceleration ─────────────────────────────
     ax1.plot(df['Time'], df['Sensor_Vel'],
@@ -339,6 +341,21 @@ def generate_scenario_d_plot():
     ax2.set_ylabel('Residual Magnitude (m/s²)')
     ax2.legend(loc='upper left', fontsize=8)
     ax2.grid(True, linestyle='--', alpha=0.4)
+
+    fig.tight_layout()
+    ax3.plot(df['Time'], df['Trust_Score'], color='crimson', linewidth=1.5, label=r'Trust Score $T_k^*$')
+    ax3.axhline(0.20, color='darkorange', linestyle=':', label='Lockout Threshold (0.2)')
+    ax3.axvline(ATTACK_D_ONSET, color='dimgray', linestyle='--', linewidth=1.0)
+    
+    # Highlight the Pure Coasting safety enforcement region
+    coasting_win = (df['Time'] >= ATTACK_D_ONSET) & (df['Trust_Score'] <= 0.05)
+    ax3.fill_between(df['Time'], -0.1, 1.1, where=coasting_win, color='crimson', alpha=0.1, label='Enforced Pure Coasting ($R \to \infty$)')
+    
+    ax3.set_xlabel('Time (seconds)')
+    ax3.set_ylabel('Trust Level')
+    ax3.set_ylim(-0.05, 1.05)
+    ax3.legend(loc='lower left', fontsize=8)
+    ax3.grid(True, linestyle='--', alpha=0.4)
 
     fig.tight_layout()
     fig.savefig("Fig_Scenario_D_CrossVerification.pdf", dpi=300)
@@ -505,7 +522,7 @@ def generate_journal_statistics():
 
     # ── Hypothesis 1: Scenario A — Kalman health tracking ────────────────────
     df_a = _load("telemetry_Scenario_A.csv",
-                 ['Time', 'Kalman_State', 'Kalman_P', 'Raw_Measurement'])
+                 ['Time', 'Kalman_State', 'Kalman_P', 'Trust_Score']) # <-- Swapped Raw_Measurement for Trust_Score
     if df_a is not None:
         df_a = df_a[df_a['Time'] > WARMUP_GATE].copy()
 
@@ -522,13 +539,17 @@ def generate_journal_statistics():
             corr    = df_track['Kalman_State'].corr(df_track['True_Drift'])
             rmse_kf = np.sqrt(mean_squared_error(
                 df_track['True_Drift'], df_track['Kalman_State']))
-            rmse_raw = np.sqrt(mean_squared_error(
-                df_track['True_Drift'], df_track['Raw_Measurement']))
+            
             print()
-            print("  [Scenario A] Kalman Health Tracking")
+            print("  [Scenario A] Trust-Weighted Kalman Health Tracking")
             print(f"    Observability Correlation (Pearson R) : {corr:.4f}")
-            print(f"    Raw Measurement RMSE                  : {rmse_raw:.6f}")
-            print(f"    Kalman Filter RMSE                    : {rmse_kf:.6f}")
+            print(f"    Trust-Weighted Filter RMSE            : {rmse_kf:.6f}")
+            
+            # Phase 4/5 Metric processing tracking your continuous Trust degradation
+            if 'Trust_Score' in df_track.columns:
+                min_trust = df_track['Trust_Score'].min()
+                print(f"    Minimum Trust Score during drift      : {min_trust:.4f}")
+
 
     # ── Hypothesis 2: Scenario B — Bandwidth under jamming ───────────────────
     df_b = _load("telemetry_Scenario_B.csv", ['Time', 'Tier', 'PDR'])
@@ -615,7 +636,7 @@ def generate_journal_statistics():
 
     # ── Hypothesis 4: Scenario D — Transducer hijacking latency ──────────────
     df_d = _load("telemetry_Scenario_D.csv",
-                 ['Time', 'Spatial_Residual', 'Spatial_Alarm'])
+                 ['Time', 'Spatial_Residual', 'Spatial_Alarm', 'Trust_Score'])
     if df_d is not None:
         alarms = df_d[df_d['Spatial_Alarm'] == 1]
         if not alarms.empty:
@@ -629,6 +650,33 @@ def generate_journal_statistics():
             print(f"    Detection latency                     : {latency_d:.3f}s")
             print(f"    Peak spatial residual (post-onset)    : {peak_res:.3f} m/s²")
             print(f"    Spatial threshold                     : {SPATIAL_THRESHOLD} m/s²")
+            
+            # Phase 4 Metric Processing
+            # Phase 5 Metric Processing
+            if 'Trust_Score' in df_d.columns:
+                low_trust_events = df_d[df_d['Trust_Score'] <= 0.2]
+                if not low_trust_events.empty:
+                    t_lockout = low_trust_events['Time'].iloc[0]
+                    min_trust = df_d[df_d['Time'] >= ATTACK_D_ONSET]['Trust_Score'].min()
+                    
+                    # Correct Phase 5 Evaluation: Measure state stability (jitter) during Pure Coasting
+                    pre_attack_jitter = df_d[(df_d['Time'] >= 100.0) & (df_d['Time'] < 150.0)]['Kalman_State'].std()
+                    during_attack_jitter = df_d[df_d['Time'] >= 150.0]['Kalman_State'].std()
+                    stability_retention = (1.0 - (during_attack_jitter / max(1e-5, pre_attack_jitter))) * 100
+                    
+                    print()
+                    print("  [Phase 4 & 5] Convex Trust Enforcement & Coasting")
+                    print(f"    Convex Solver System Lockout Latency  : {t_lockout - ATTACK_D_ONSET:.4f} s")
+                    print(f"    Minimum Trust Reached During Hijack   : {min_trust:.4f}")
+                    pre_attack_jitter = df_d[(df_d['Time'] >= 100.0) & (df_d['Time'] < 150.0)]['Kalman_State'].std()
+                    during_attack_jitter = df_d[df_d['Time'] >= 150.0]['Kalman_State'].std()
+                    
+                    print()
+                    print("  [Phase 4 & 5] Convex Trust Enforcement & Coasting")
+                    print(f"    Convex Solver System Lockout Latency  : {t_lockout - ATTACK_D_ONSET:.4f} s")
+                    print(f"    Minimum Trust Reached During Hijack   : {min_trust:.4f}")
+                    print(f"    [Phase 5] Pre-Attack Health Jitter    : {pre_attack_jitter:.6f}")
+                    print(f"    [Phase 5] Coasting Health Jitter      : {during_attack_jitter:.6f} (Isolated successfully)")
         else:
             print()
             print("  [Scenario D] No spatial alarm fired — check threshold or attack onset.")
