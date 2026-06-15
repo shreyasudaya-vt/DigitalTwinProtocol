@@ -301,10 +301,10 @@ int main(int argc, char *argv[]) {
     uavMobHelper.Install(nodes.Get(0));
     Ptr<WaypointMobilityModel> uavMob = nodes.Get(0)->GetObject<WaypointMobilityModel>();
 
-    uavMob->AddWaypoint(Waypoint(Seconds(0.0),   Vector(0.0,   0.0, 20.0))); // t=0:  20m above BS
-    uavMob->AddWaypoint(Waypoint(Seconds(100.0),  Vector(100.0, 0.0, 20.0))); // t=100: 20m above far end
-    uavMob->AddWaypoint(Waypoint(Seconds(200.0),  Vector(0.0,   0.0, 20.0))); // t=200: 20m above BS
-    uavMob->AddWaypoint(Waypoint(Seconds(300.0),  Vector(100.0, 0.0, 20.0)));  
+    uavMob->AddWaypoint(Waypoint(Seconds(0.0),   Vector(0.0,   0.0, 0.0))); // t=0:  20m above BS
+    uavMob->AddWaypoint(Waypoint(Seconds(100.0),  Vector(100.0, 0.0, 0.0))); // t=100: 20m above far end
+    uavMob->AddWaypoint(Waypoint(Seconds(200.0),  Vector(0.0,   0.0, 0.0))); // t=200: 20m above BS
+    uavMob->AddWaypoint(Waypoint(Seconds(300.0),  Vector(100.0, 0.0, 0.0)));  
 
     InternetStackHelper stack;
     stack.Install(nodes);
