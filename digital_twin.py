@@ -231,59 +231,59 @@ class DigitalTwinServer:
                 self.consecutive_anomalies = 0
                 self.is_locked_out = False
             else:
-                # RESTORED: Paper's original hd > 8 and 5-packet confirmation
+                # ====================================================================
+                # UNIFIED HYSTERESIS LATCH (IDENTITY & HEALTH LAYERS)
+                # ====================================================================
+                
+                # 1. Identity Layer (Crypto/Hamming Distance)
                 if hd > self.hd_threshold and pdr > 0.85:
-                    self._id_anomalies += 1
-                    if self._id_anomalies >= 5: id_alarm = 1
+                    # Instant spike to ensure interleaved identity attacks are caught
+                    self._id_anomalies = min(100, self._id_anomalies + 50)
                 else:
-                    self._id_anomalies = max(0, self._id_anomalies - 1)
+                    # Slow decay bridges the gaps between interleaved packets
+                    self._id_anomalies = max(0, self._id_anomalies - 0.5)
+                    
+                if not hasattr(self, '_is_id_latched'): 
+                    self._is_id_latched = False
+                
+                if self._id_anomalies >= 15: 
+                    self._is_id_latched = True
+                elif self._id_anomalies == 0: 
+                    self._is_id_latched = False
+                    
+                id_alarm = 1 if self._is_id_latched else 0
 
+                # 2. Health Layer (Kalman Filter Innovation)
+                is_anomalous = (abs(innovation) > threshold)
+                
+                if is_anomalous:
+                    self.consecutive_anomalies = min(100, self.consecutive_anomalies + 50)
+                else:
+                    self.consecutive_anomalies = max(0, self.consecutive_anomalies - 0.5)
+                    
+                if not hasattr(self, '_is_attack_latched'): 
+                    self._is_attack_latched = False
+                
+                if self.consecutive_anomalies >= 15: 
+                    self._is_attack_latched = True
+                elif self.consecutive_anomalies == 0: 
+                    self._is_attack_latched = False
+                    
+                health_alarm = 1 if self._is_attack_latched else 0
+
+                # 3. State Freeze (Prevent Model Poisoning)
                 if self.blackout_recovery and not id_alarm:
                     self.kf.x = np.array([[health_drift], [0.0005]])
                     self.kf.P = np.array([[1e-4, 0.0], [0.0, 1e-4]])
                     self.consecutive_anomalies = 0
                     self.blackout_recovery = False
-                    
-                # RESTORED: Pure Coasting logic
-                # --- SCENARIO C: TRUE HYSTERESIS & INSTANT FREEZE ---
-                elif True: 
-                    is_anomalous = (abs(innovation) > threshold)
-                    
-                    if is_anomalous:
-                        # INSTANT LATCH: 100% Precision means we have absolute confidence.
-                        # Jump the counter heavily to guarantee it triggers immediately.
-                        self.consecutive_anomalies = min(100, self.consecutive_anomalies + 50)
-                    else:
-                        # Slower decay: Requires 200 consecutive clean packets (~3 seconds) 
-                        # to unlatch, easily bridging the 1:10 injection gaps.
-                        self.consecutive_anomalies = max(0, self.consecutive_anomalies - 0.5)
-                        
-                    if not hasattr(self, '_is_attack_latched'):
-                        self._is_attack_latched = False
-                        
-                    if self.consecutive_anomalies >= 15:
-                        self._is_attack_latched = True
-                    elif self.consecutive_anomalies == 0:
-                        self._is_attack_latched = False
-                        
-                    health_alarm = 1 if self._is_attack_latched else 0
-                    
-                    # Revert the state to stop Covariance Explosion / Model Poisoning
-                    if is_anomalous or health_alarm or id_alarm:
-                        self.kf.x = x_saved
-                        self.kf.P = P_saved
-                    else:
-                        self.kf.update(np.array([[health_drift]]))
-                
+                elif is_anomalous or health_alarm or id_alarm:
+                    # Freeze the state to ignore malicious/interleaved telemetry
+                    self.kf.x = x_saved
+                    self.kf.P = P_saved
                 else:
-                    # Normal safe operations
-                    self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
-                    
-                    # Ensure latch clears if we are in completely normal territory
-                    if getattr(self, '_is_attack_latched', False) and self.consecutive_anomalies < 5:
-                        self._is_attack_latched = False
-                        
                     self.kf.update(np.array([[health_drift]]))
+                
             alarm_triggered = 1 if (id_alarm or health_alarm or spatial_alarm) else 0
 
             self.csv_writer.writerow([
@@ -378,12 +378,20 @@ class DigitalTwinServer:
             
             id_alarm = 0
             if telemetry >= 25.0 and self.warmup_count >= self.WARMUP_PACKETS and hd > self.hd_threshold and pdr > 0.85:
-                self._id_anomalies += 1
-                if self._id_anomalies >= 5: id_alarm = 1
+                self._id_anomalies = min(100, self._id_anomalies + 50)
             else:
-                self._id_anomalies = max(0, self._id_anomalies - 1)
+                self._id_anomalies = max(0, self._id_anomalies - 0.5)
+                
+            if not hasattr(self, '_is_id_latched'): 
+                self._is_id_latched = False
+                
+            if self._id_anomalies >= 15: 
+                self._is_id_latched = True
+            elif self._id_anomalies == 0: 
+                self._is_id_latched = False
+                
+            id_alarm = 1 if self._is_id_latched else 0
 
-            # FIX: Included health_alarm in the final Tier 2 trigger
             alarm_triggered = 1 if (id_alarm or spatial_alarm or health_alarm) else 0
 
             self.csv_writer.writerow([
