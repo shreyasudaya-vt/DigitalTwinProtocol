@@ -324,7 +324,7 @@ def generate_scenario_d_plot():
     ax3.axvline(ATTACK_D_ONSET, color='dimgray', linestyle='--', linewidth=1.0)
     
     coasting_win = (df['Time'] >= ATTACK_D_ONSET) & (df['Trust_Score'] <= 0.05)
-    ax3.fill_between(df['Time'], -0.1, 1.1, where=coasting_win, color='crimson', alpha=0.1, label='Enforced Pure Coasting ($R \to \infty$)')
+    ax3.fill_between(df['Time'], -0.1, 1.1, where=coasting_win, color='crimson', alpha=0.1, label=r'Enforced Pure Coasting ($R \to \infty$)')
     
     ax3.set_xlabel('Time (seconds)')
     ax3.set_ylabel('Trust Level')

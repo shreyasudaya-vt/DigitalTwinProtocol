@@ -344,10 +344,8 @@ class DigitalTwinServer:
             dyn_threshold = float(3.5 * np.sqrt(float(self.kf.P[0, 0] + current_R_base)))
             threshold = max(0.045, dyn_threshold)
 
-            health_alarm = 1 if getattr(self, '_is_attack_latched', False) else 0
 
-            if self.received_packets_since_tier_drop > 25:
-                health_alarm = 1
+            health_alarm = 1 if getattr(self, '_is_attack_latched', False) else 0
 
             norm_spatial = spatial_residual / 3.0
             anomaly_factor = 0.6 * (1.0 if health_alarm else 0.0) + 0.4 * norm_spatial
@@ -416,6 +414,11 @@ class DigitalTwinServer:
         try:
             while True:
                 data, _ = self.rx_sock.recvfrom(2048)
+                if data.startswith(b'ENROLL'):
+                    payload = data[6:]
+                    self.stable_bit_indices = np.array(struct.unpack(f'!{len(payload)}B', payload))
+                    print(f"Verified Identity Mask Synchronized: {self.stable_bit_indices}")
+                    return
                 self.process_packet(data)
         except KeyboardInterrupt:
             self.log_file.close()

@@ -59,6 +59,7 @@ class AnastaEdgeNode:
         self.master_key = master_key
         self.salt = salt
         self.sequence_counter = 0
+        
         self.current_tier = 1  
         self.PDR_DROP_THRESHOLD = 0.75     # Breakpoint to drop into Fountain mode
         self.PDR_RECOVER_THRESHOLD = 0.85  # Breakpoint to recover to Hi-Fi mode
@@ -130,6 +131,7 @@ class AnastaEdgeNode:
         self.device_files_map = {"MOCK_DEV_01": {}}
 
     def _listen_for_feedback(self):
+        
         while self.running:
             try:
                 data, _ = self.feedback_sock.recvfrom(1024)
@@ -138,16 +140,17 @@ class AnastaEdgeNode:
                 current_time = time.time()
                 cooldown_seconds = 1.0
                 if current_time - self.last_switch_time > cooldown_seconds:
-                    if self.current_tier == 1:
-                        if self.smoothed_pdr < self.PDR_DROP_THRESHOLD:
-                            self.current_tier = 2
-                            print(f"🚨 PDR Dropped to {pdr:.2f} (< {self.PDR_DROP_THRESHOLD}). Switching to Tier 2 Fountain Mode.")
-                    
-                    elif self.current_tier == 2:
-                        if self.smoothed_pdr > self.PDR_RECOVER_THRESHOLD:
-                            self.current_tier = 1
-                            print(f"🟢 PDR Recovered to {pdr:.2f} (> {self.PDR_RECOVER_THRESHOLD}). Switching to Tier 1 High-Fidelity Mode.")
-                            
+                    if pdr < 0.70 and self.current_tier == 1:
+                        self.current_tier = 2
+                        self.last_switch_time = current_time  
+                        # [FIXED]: Removed 'elapsed' and just use standard logging
+                        print(f"[Edge] ⚠️ PDR dropped to {pdr:.2f}. Switching to TIER 2.")
+                    elif pdr > 0.85 and self.current_tier == 2:
+                        self.current_tier = 1
+                        self.last_switch_time = current_time 
+                        # [FIXED]: Removed 'elapsed' and just use standard logging
+                        print(f"[Edge] 🟢 PDR recovered to {pdr:.2f}. Restoring TIER 1.")
+                
             except Exception:
                 break
 
@@ -241,6 +244,13 @@ if __name__ == "__main__":
     w_high_base = proj_base[:node.n_identity]
     stable_indices = np.where(np.abs(w_high_base) > 0.05)[0]
 
+    # ------------------------------------------------------------------
+    # [NEW ENROLLMENT PATCH] Transmit the mask before the loop starts
+    # ------------------------------------------------------------------
+    print(f"[Main] Transmitting Identity Enrollment Mask ({len(stable_indices)} stable bits)...")
+    enrollment_packet = struct.pack(f'!{len(stable_indices)}B', *stable_indices)
+    node.tx_sock.sendto(b'ENROLL' + enrollment_packet, node.ns3_address)
+
     sweep_idx = 0
     stealth_drift = 0.0
     start_time = time.time()
@@ -249,8 +259,7 @@ if __name__ == "__main__":
     
     try:
         while True:
-            elapsed_time = time.time() - start_time
-
+            elapsed_time = sweep_idx * 0.01
             # ------------------------------------------------------------------
             # STEP 1: PHYSICAL HARDWARE IMPEDANCE INGESTION
             # ------------------------------------------------------------------
@@ -291,7 +300,7 @@ if __name__ == "__main__":
                 sensor_accel = true_structural_accel + np.random.normal(0, 0.15)
                 
                 # TRANSDUCER HIJACKING ATTACK: Exactly at t=150s, attacker spoofs fake collision/damage
-                if elapsed_time >= 150.0:
+                if elapsed_time >= 25.0:
                     sensor_accel += 15.0  # Spikes kinematic telemetry line maliciously
                 
                 # THE CROSS-MODAL CONTRADDICTION: Maintain a completely clean, uncompromised material health matrix.
@@ -310,7 +319,7 @@ if __name__ == "__main__":
                     node.transmit(k_auth, current_health, telemetry_val1=elapsed_time, telemetry_val2=0.0, telemetry_val3=0.0)
                 
                 sweep_idx += 1
-                time.sleep(0.01)  # Strict 10ms framework pacing
+                #time.sleep(0.01)  
 
             except (BrokenPipeError, ConnectionResetError, OSError):
                 print("🔌 NS-3 simulation socket closed. Terminating edge node loop cleanly.")
