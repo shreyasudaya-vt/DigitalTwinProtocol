@@ -31,6 +31,8 @@ class DigitalTwinServer:
         self.is_enrolled = False
         self.baseline_k_auth_bits = None
         self.baseline_k_health = None
+        self.stable_bit_indices = np.array([0, 1, 2]) # <--- PASTE ARRAY HERE
+        self.hd_threshold = max(2, int(len(self.stable_bit_indices) * 0.12))
 
         self.received_packets_since_tier_drop = 0
         self.bp_graph = []       
@@ -46,6 +48,8 @@ class DigitalTwinServer:
         
         self.kf.R = np.array([[0.0005]]) 
         self.kf.Q = np.array([[1e-4, 0.0], [0.0, 1e-6]])
+        
+    
     
         self.warmup_count = 0
         self.WARMUP_PACKETS = 25
@@ -160,13 +164,13 @@ class DigitalTwinServer:
                     self._spatial_counter = 0
                 else:
                     self.vel_error_integral += step_kinematic_mismatch
-                    self.vel_error_integral *= 0.98  
+                    self.vel_error_integral *= 0.995  
                 
                 spatial_residual = abs(self.vel_error_integral)
                 kinematic_drift = self.vel_error_integral  
                 
                 # RESTORED: Paper's original 3.0m/s^2 spatial threshold
-                if spatial_residual > 3.0 and telemetry > 25.0:
+                if spatial_residual > 1.0 and telemetry > 25.0:
                     self._spatial_counter += 1
                 else:
                     self._spatial_counter = max(0, self._spatial_counter - 1)
@@ -190,9 +194,9 @@ class DigitalTwinServer:
                     if np.any(np.isnan(k_health_rec)) or np.any(np.isinf(k_health_rec)):
                         raise ValueError("Mangled floats due to RF noise.")
                 except (struct.error, ValueError):
-                    k_health_rec = self.baseline_k_health if self.baseline_k_health is not None else np.zeros(32)
+                    k_health_rec = np.full(32, 9999.0) if self.is_enrolled else np.zeros(32)
             else:
-                k_health_rec = self.baseline_k_health if self.baseline_k_health is not None else np.zeros(32)
+                k_health_rec = np.full(32, 9999.0) if self.is_enrolled else np.zeros(32)
 
             k_auth_rec = bytes(a ^ b for a, b in zip(p_auth, n_i))
             rec_bits = np.unpackbits(np.frombuffer(k_auth_rec, dtype=np.uint8))
@@ -202,15 +206,19 @@ class DigitalTwinServer:
                 self.baseline_k_health = np.copy(k_health_rec)
                 self.is_enrolled = True
 
-            hd = int(np.sum(rec_bits != self.baseline_k_auth_bits))
+            stable_rec = rec_bits[self.stable_bit_indices]
+            stable_base = self.baseline_k_auth_bits[self.stable_bit_indices]
+            hd = int(np.sum(stable_rec != stable_base))
             health_drift = float(np.linalg.norm(k_health_rec - self.baseline_k_health))
-            
+            x_saved = np.copy(self.kf.x)
+            P_saved = np.copy(self.kf.P)
+
             self.kf.F[0, 1] = dt
             self.kf.predict()
             
             innovation = float(health_drift - self.kf.x[0, 0])
             S_pre = float(self.kf.P[0, 0] + self.kf.R[0, 0])
-            
+
             # RESTORED: Paper's original 3.0 Sigma envelope
             dyn_threshold = float(3.0 * np.sqrt(S_pre))
             threshold = max(0.015, dyn_threshold)
@@ -224,7 +232,7 @@ class DigitalTwinServer:
                 self.is_locked_out = False
             else:
                 # RESTORED: Paper's original hd > 8 and 5-packet confirmation
-                if hd > 8 and pdr > 0.85:
+                if hd > self.hd_threshold and pdr > 0.85:
                     self._id_anomalies += 1
                     if self._id_anomalies >= 5: id_alarm = 1
                 else:
@@ -237,23 +245,45 @@ class DigitalTwinServer:
                     self.blackout_recovery = False
                     
                 # RESTORED: Pure Coasting logic
-                elif abs(innovation) > threshold or id_alarm:
-                    if not id_alarm and pdr >= 0.80 and abs(innovation) > threshold:
-                        self.consecutive_anomalies = min(30, self.consecutive_anomalies + 1)
-                        # RESTORED: Paper's original 15-packet health counter
-                        if self.consecutive_anomalies >= 15: health_alarm = 1
+                # --- SCENARIO C: TRUE HYSTERESIS & INSTANT FREEZE ---
+                elif True: 
+                    is_anomalous = (abs(innovation) > threshold)
+                    
+                    if is_anomalous:
+                        # INSTANT LATCH: 100% Precision means we have absolute confidence.
+                        # Jump the counter heavily to guarantee it triggers immediately.
+                        self.consecutive_anomalies = min(100, self.consecutive_anomalies + 50)
                     else:
-                        self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
+                        # Slower decay: Requires 200 consecutive clean packets (~3 seconds) 
+                        # to unlatch, easily bridging the 1:10 injection gaps.
+                        self.consecutive_anomalies = max(0, self.consecutive_anomalies - 0.5)
                         
-                    if health_alarm or id_alarm:
-                        R_orig = self.kf.R.copy()
-                        self.kf.R = R_orig * 10000.0
+                    if not hasattr(self, '_is_attack_latched'):
+                        self._is_attack_latched = False
+                        
+                    if self.consecutive_anomalies >= 15:
+                        self._is_attack_latched = True
+                    elif self.consecutive_anomalies == 0:
+                        self._is_attack_latched = False
+                        
+                    health_alarm = 1 if self._is_attack_latched else 0
+                    
+                    # Revert the state to stop Covariance Explosion / Model Poisoning
+                    if is_anomalous or health_alarm or id_alarm:
+                        self.kf.x = x_saved
+                        self.kf.P = P_saved
+                    else:
                         self.kf.update(np.array([[health_drift]]))
-                        self.kf.R = R_orig
+                
                 else:
+                    # Normal safe operations
                     self.consecutive_anomalies = max(0, self.consecutive_anomalies - 1)
+                    
+                    # Ensure latch clears if we are in completely normal territory
+                    if getattr(self, '_is_attack_latched', False) and self.consecutive_anomalies < 5:
+                        self._is_attack_latched = False
+                        
                     self.kf.update(np.array([[health_drift]]))
-
             alarm_triggered = 1 if (id_alarm or health_alarm or spatial_alarm) else 0
 
             self.csv_writer.writerow([
@@ -312,15 +342,23 @@ class DigitalTwinServer:
             self.kf.predict()
             estimated_health = float(self.kf.x[0, 0])
             
-            # RESTORED: Paper's original 3.0 Sigma envelope
             dyn_threshold = float(3.0 * np.sqrt(float(self.kf.P[0, 0] + self.kf.R[0, 0])))
             threshold = max(0.015, dyn_threshold)
 
+            # Carry over the latched attack state into Tier 2
+            health_alarm = 1 if getattr(self, '_is_attack_latched', False) else 0
+
+            # NEW FIX: Tier 2 Starvation/Flood Detection
+            if self.received_packets_since_tier_drop > 25:
+                health_alarm = 1
+
             unobserved = 128 - len(self.resolved_bits)
             if unobserved > 0:
+                alarm_triggered = 1 if (health_alarm or spatial_alarm) else 0
+                
                 self.csv_writer.writerow([
                     telemetry, seq, tier_id, pdr, unobserved, 
-                    np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, spatial_alarm,
+                    np.nan, estimated_health, float(self.kf.P[0, 0]), 0.0, threshold, alarm_triggered,
                     sens_vel, sens_accel, kinematic_drift, spatial_residual, spatial_alarm
                 ])
                 self.log_file.flush()
@@ -334,17 +372,19 @@ class DigitalTwinServer:
                 self.baseline_k_auth_bits = np.copy(final_bits)
                 self.is_enrolled = True
 
-            hd = int(np.sum(final_bits != self.baseline_k_auth_bits))
+            stable_final = final_bits[self.stable_bit_indices]
+            stable_base = self.baseline_k_auth_bits[self.stable_bit_indices]
+            hd = int(np.sum(stable_final != stable_base))
             
             id_alarm = 0
-            # RESTORED: Paper's original hd > 8 and 5-packet confirmation
-            if telemetry >= 25.0 and self.warmup_count >= self.WARMUP_PACKETS and hd > 8 and pdr > 0.85:
+            if telemetry >= 25.0 and self.warmup_count >= self.WARMUP_PACKETS and hd > self.hd_threshold and pdr > 0.85:
                 self._id_anomalies += 1
                 if self._id_anomalies >= 5: id_alarm = 1
             else:
                 self._id_anomalies = max(0, self._id_anomalies - 1)
 
-            alarm_triggered = 1 if (id_alarm or spatial_alarm) else 0
+            # FIX: Included health_alarm in the final Tier 2 trigger
+            alarm_triggered = 1 if (id_alarm or spatial_alarm or health_alarm) else 0
 
             self.csv_writer.writerow([
                 telemetry, seq, tier_id, pdr, hd,

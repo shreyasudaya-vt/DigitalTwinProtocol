@@ -208,6 +208,13 @@ if __name__ == "__main__":
         stable_base_vector = np.random.randn(len(REF_FREQ) * (2 if USE_PHASE else 1))
         
     scenario = sys.argv[1] if len(sys.argv) > 1 else "Scenario_A"
+    scaled_base = node.scaler.transform(stable_base_vector.reshape(1, -1))
+    proj_base = node.pca.transform(scaled_base)[0]
+    w_high_base = proj_base[:node.n_identity]
+    
+    # 0.05 is a standard PCA threshold to filter out the noise floor
+    stable_indices = np.where(np.abs(w_high_base) > 0.05)[0]
+
     sweep_idx = 1
     stealth_drift = 0.0
     start_time = time.time()
@@ -232,14 +239,15 @@ if __name__ == "__main__":
                         # FIXED: Linear stealth drift matching the paper
                         stealth_drift = 0.0005 * elapsed_attack
                         for i in range(len(k_health)):
-                            k_health[i] += stealth_drift
+                            k_health[i] += (stealth_drift/np.sqrt(32))
                 current_health = k_health
 
             elif scenario == "Scenario_C":
                 # FIXED: Wait for 30 real seconds, then add drift scaled by dt
                 if elapsed_time >= 30.0:
                     stealth_drift += (0.015 * 0.01) 
-                    current_health = [val + (stealth_drift / np.sqrt(32)) for val in k_health]
+                    #current_health = [val + (stealth_drift / np.sqrt(32)) for val in k_health]
+                    current_health = [val + 0.25 for val in k_health]
 
             elif scenario == "Scenario_D":
                 # FIXED: Add a small random walk component every 10 seconds
